@@ -64,12 +64,12 @@ function LcdIfPossible()
       lcd %:h
    endif
 endfunction
-if !&diff
-    augroup Lcd
-        autocmd!
-        autocmd BufWinEnter * call LcdIfPossible()
-    augroup END
-endif
+"if !&diff
+"    augroup Lcd
+"        autocmd!
+"        autocmd BufWinEnter * call LcdIfPossible()
+"    augroup END
+"endif
 
 "Force standard backspace behaviour
 set backspace=2
@@ -306,10 +306,12 @@ if !&diff && !&pvw
     " GoToReferences keybound to F4
     inoremap <F5> <Esc> :YcmCompleter GoToReferences<CR>
     nnoremap <F5>  :YcmCompleter GoToReferences<CR>
-
     " Format using clang
     inoremap <F7> <Esc> :%!clang-format -style=LLVM<CR>
     nnoremap <F7>  :%!clang-format -style=LLVM<CR>
+    " Find usages/occurrences in current file using vim-grep
+    inoremap <expr> <F8>  "<Esc> :lv /".expand('<cword>')."/j % \| :lwindow<CR>"
+    nnoremap <expr> <F8> ":lv /".expand('<cword>')."/j % \| :lwindow<CR>"
 
 endif
 
@@ -320,13 +322,5 @@ endif
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 set t_Co=256
 "colorscheme onedark
-"if !&diff
-"    "let g:zenburn_high_Contrast=1
-"    "let g:zenburn_alternate_Visual=1
-"    "colorscheme zenburn
-"    colorscheme onedark
-"else 
-"    colorscheme onedark
-"endif
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
