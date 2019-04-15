@@ -1,9 +1,6 @@
-"Ignore the warning message if a swap file exists
-set shortmess+=A
-
 "Ensure clipboard works with vimx
-"set clipboard=unnamedplus
 set clipboard=unnamed
+
 "Search for tags files all the way back to /
 "Tags are a way of indexing code - useful for multifile projects
 set tags=tags;/
@@ -31,32 +28,13 @@ set expandtab
 set shiftwidth=2
 set smarttab
 
-
 set noswapfile
 
 "Colouring
 set background=dark
 
-"Enable Solarized colorscheme with vim
-"let g:solarized_termcolors=16
-"let g:solarized_contrast="normal"
-"let g:solarized_visibility="normal"
-"colorscheme solarized
-"
-
-"highlight PMenuSel cterm=bold ctermbg=Green ctermfg=None
-
-
 "Ignore case on searches
 set ic
-
-"For the brave!
-"Unbind arrow keys!
-"for prefix in ['i', 'n', 'v']
-"  for key in ['<Up>', '<Down>', '<Left>', '<Right>']
-"      exe prefix . "noremap " . key . " <Nop>"
-"    endfor
-"endfor
 
 "Move the vim local dir around intuitively
 function LcdIfPossible()
@@ -76,24 +54,6 @@ set backspace=2
 
 "Force bash-like tab completion
 set completeopt=longest,menuone,preview
-
-"Remap default register to + to force copy paste behaviour in shell
-"only if not in differencing mode
-"if &diff
-"else
-"    vnoremap y "+y
-"    nnoremap y "+y
-"    vnoremap Y "+Y
-"    nnoremap Y "+Y
-"    vnoremap p "+p
-"    nnoremap p "+p
-"    vnoremap P "+P
-"    nnoremap P "+P
-"    vnoremap d "+d
-"    nnoremap d "+d
-"    vnoremap x "+x
-"    nnoremap x "+x
-"endif
 
 "Support IDL, Matlab and Python files
 set suffixesadd+=.pro
@@ -136,9 +96,6 @@ set errorformat^=%-GIn\ file\ included\ from\ %f:%l:%c:,%-GIn\ file
 " Adapted from http://blog.chmd.fr/continuous-background-compilation-within-vim.html
 " and http://stackoverflow.com/questions/2760014/how-can-i-configure-vim-so-that-when-i-send-the-process-a-usr1-signal-it-saves-a/22089803#22089803
 nnoremap <leader>m : call setqflist([]) \| cclose \| silent execute ":! (make &>~/.vim/cpperr; vimx --servername " . v:servername . " --remote-send '\<C-\\>\<C-N\>:cgetfile ~/.vim/cpperr \| echo \"make finished.\"\<CR\>')&" \| redraw! \| echo "make running..."<CR>
-
-" Execute current line
-"nmap <F6> :exec '!'.getline('.')<CR>
 
 
 "hi cursorline cterm=none ctermbg=darkred ctermfg=white guibg=darkred guifg=white
@@ -318,9 +275,18 @@ endif
 
 
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
-"" COLORS:
+"" COLORS AND DISPLAY:
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 set t_Co=256
-"colorscheme onedark
-"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+colorscheme onedark
+
+" Make a nicer statusline
+set statusline=%t[%{strlen(&fenc)?&fenc:'none'},%{&ff}]%h%m%r%y%=%c,%l/%L\ %P
+hi StatusLine ctermbg=grey ctermfg=black
+hi StatusLineNC ctermbg=black ctermfg=grey
+
+"If the Pmenu is messed up try setting colors manually:
+"highlight PMenuSel cterm=bold ctermbg=Green ctermfg=None
+
+
 
