@@ -170,14 +170,15 @@ if !&diff
     Plugin 'xolox/vim-easytags'
     Plugin 'scrooloose/nerdtree'
     Plugin 'Valloric/YouCompleteMe'
-    Plugin 'morhetz/gruvbox'
-    Plugin 'tyrannicaltoucan/vim-quantum'
-    Plugin 'joshdick/onedark.vim'
-    Plugin 'mhartington/oceanic-next'
-    Plugin 'arcticicestudio/nord-vim'
     Plugin 'rdnetto/YCM-Generator'
     Plugin 'vim-scripts/DoxygenToolkit.vim'
 endif
+
+" These are colorschemes so okay to have in diff
+Plugin 'morhetz/gruvbox'
+Plugin 'tyrannicaltoucan/vim-quantum'
+Plugin 'joshdick/onedark.vim'
+Plugin 'mhartington/oceanic-next'
 
 
 " All of your Plugins must be added before the following line

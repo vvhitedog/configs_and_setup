@@ -52,3 +52,8 @@ run_cmd("git checkout -b alt-translation-unit remotes/puremourning/alt-translati
 os.chdir(ycmdir)
 run_cmd("git submodule update --init --recursive")
 run_cmd("./install.py --clang-completer")
+
+"""
+Note that this was all infered from https://github.com/Valloric/YouCompleteMe/issues/2796#issuecomment-333384095
+if you dont want the alternate TU version of YCM simply remove the branch checkout
+"""
