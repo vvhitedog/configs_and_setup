@@ -1,0 +1,331 @@
+"Ignore the warning message if a swap file exists
+set shortmess+=A
+
+"Ensure clipboard works with vimx
+"set clipboard=unnamedplus
+set clipboard=unnamed
+"Search for tags files all the way back to /
+"Tags are a way of indexing code - useful for multifile projects
+set tags=tags;/
+
+"Turn on filetype plugins and indentation
+filetype indent plugin on
+
+"Turn syntax highlighting on by default
+syntax on
+
+"Turn on file numbers
+set number
+
+"Turn on folding based on markers
+set fdm=marker
+
+"Indenting
+set cindent
+"set smartindent " apparently this is deprecated
+set autoindent
+
+"Tabbing
+set tabstop=2           " set tab to 2 spaces
+set expandtab
+set shiftwidth=2
+set smarttab
+
+
+set noswapfile
+
+"Colouring
+set background=dark
+
+"Enable Solarized colorscheme with vim
+"let g:solarized_termcolors=16
+"let g:solarized_contrast="normal"
+"let g:solarized_visibility="normal"
+"colorscheme solarized
+"
+
+"highlight PMenuSel cterm=bold ctermbg=Green ctermfg=None
+
+
+"Ignore case on searches
+set ic
+
+"For the brave!
+"Unbind arrow keys!
+"for prefix in ['i', 'n', 'v']
+"  for key in ['<Up>', '<Down>', '<Left>', '<Right>']
+"      exe prefix . "noremap " . key . " <Nop>"
+"    endfor
+"endfor
+
+"Move the vim local dir around intuitively
+function LcdIfPossible()
+   if filereadable(@%)
+      lcd %:h
+   endif
+endfunction
+if !&diff
+    augroup Lcd
+        autocmd!
+        autocmd BufWinEnter * call LcdIfPossible()
+    augroup END
+endif
+
+"Force standard backspace behaviour
+set backspace=2
+
+"Force bash-like tab completion
+set completeopt=longest,menuone,preview
+
+"Remap default register to + to force copy paste behaviour in shell
+"only if not in differencing mode
+"if &diff
+"else
+"    vnoremap y "+y
+"    nnoremap y "+y
+"    vnoremap Y "+Y
+"    nnoremap Y "+Y
+"    vnoremap p "+p
+"    nnoremap p "+p
+"    vnoremap P "+P
+"    nnoremap P "+P
+"    vnoremap d "+d
+"    nnoremap d "+d
+"    vnoremap x "+x
+"    nnoremap x "+x
+"endif
+
+"Support IDL, Matlab and Python files
+set suffixesadd+=.pro
+set suffixesadd+=.idl
+set suffixesadd+=.m
+set suffixesadd+=.py
+
+"Add current directory to path
+set path+=.
+
+"Add cuda headers to cpp highlighting
+augroup cuda_ft
+    autocmd!
+    au BufNewFile,BufRead *.cuh set filetype=cuda
+augroup END
+
+" Below taken from
+" http://vim.wikia.com/wiki/Automatically_open_the_quickfix_window_on_:make
+"
+" Automatically open, but do not go to (if there are errors) the quickfix /
+" location list window, or close it when is has become empty.
+"
+" Note: Must allow nesting of autocmds to enable any customizations for quickfix
+" buffers.
+" Note: Normally, :cwindow jumps to the quickfix window if the command opens it
+" (but not if it's already open). However, as part of the autocmd, this doesn't
+" seem to happen.
+
+augroup qf_group
+  autocmd QuickFixCmdPost [^l]* nested cwindow
+augroup END
+
+" This apparently fixes the bug when compiling C or CPP code where it jumps to 
+" header file that doesnt exist and line :0 
+set errorformat^=%-GIn\ file\ included\ from\ %f:%l:%c:,%-GIn\ file
+            \\ included\ from\ %f:%l:%c\\,,%-GIn\ file\ included\ from\ %f
+            \:%l:%c,%-GIn\ file\ included\ from\ %f:%l
+
+" A make command that will be run in the background
+" Adapted from http://blog.chmd.fr/continuous-background-compilation-within-vim.html
+" and http://stackoverflow.com/questions/2760014/how-can-i-configure-vim-so-that-when-i-send-the-process-a-usr1-signal-it-saves-a/22089803#22089803
+nnoremap <leader>m : call setqflist([]) \| cclose \| silent execute ":! (make &>~/.vim/cpperr; vimx --servername " . v:servername . " --remote-send '\<C-\\>\<C-N\>:cgetfile ~/.vim/cpperr \| echo \"make finished.\"\<CR\>')&" \| redraw! \| echo "make running..."<CR>
+
+" Execute current line
+"nmap <F6> :exec '!'.getline('.')<CR>
+
+
+"hi cursorline cterm=none ctermbg=darkred ctermfg=white guibg=darkred guifg=white
+"set nocursorline
+
+
+" ==================================================================================================================================================
+" VUNDLE SPECIFIC
+" ==================================================================================================================================================
+
+
+set nocompatible              " be iMproved, required
+filetype off                  " required
+
+" set the runtime path to include Vundle and initialize
+set rtp+=~/.vim/bundle/Vundle.vim
+call vundle#begin()
+" alternatively, pass a path where Vundle should install plugins
+"call vundle#begin('~/some/path/here')
+
+" let Vundle manage Vundle, required
+
+
+if !&diff
+    Plugin 'VundleVim/Vundle.vim'
+    Plugin 'davidhalter/jedi-vim'
+    Plugin 'majutsushi/tagbar'
+    Plugin 'xolox/vim-misc'
+    Plugin 'xolox/vim-easytags'
+    Plugin 'scrooloose/nerdtree'
+    Plugin 'Valloric/YouCompleteMe'
+    Plugin 'morhetz/gruvbox'
+    Plugin 'tyrannicaltoucan/vim-quantum'
+    Plugin 'joshdick/onedark.vim'
+    Plugin 'mhartington/oceanic-next'
+    Plugin 'arcticicestudio/nord-vim'
+    Plugin 'rdnetto/YCM-Generator'
+    Plugin 'vim-scripts/DoxygenToolkit.vim'
+endif
+
+
+" All of your Plugins must be added before the following line
+call vundle#end()            " required
+filetype plugin indent on    " required
+" To ignore plugin indent changes, instead use:
+"filetype plugin on
+"
+" Brief help
+" :PluginList       - lists configured plugins
+" :PluginInstall    - installs plugins; append `!` to update or just :PluginUpdate
+" :PluginSearch foo - searches for foo; append `!` to refresh local cache
+" :PluginClean      - confirms removal of unused plugins; append `!` to auto-approve removal
+"
+" see :h vundle for more details or wiki for FAQ
+" Put your non-Plugin stuff after this line
+
+
+"""" Specifc to plugins and filetypes
+
+
+" Check that we are not in diff or preview window modes
+if !&diff && !&pvw 
+    "" Automate synchornization in nerdtree::
+    ""===============================================
+
+    " Check if NERDTree is open or active
+    function! IsNERDTreeOpen()        
+      return exists("t:NERDTreeBufName") && (bufwinnr(t:NERDTreeBufName) != -1)
+    endfunction
+
+    " Call NERDTreeFind iff NERDTree is active, current window contains a modifiable
+    " file, and we're not in vimdiff
+    function! SyncTree()
+      if &modifiable && IsNERDTreeOpen() && strlen(expand('%')) > 0 && !&diff && !&pvw
+        "NERDTreeFind %:p:h/../../
+        "wincmd p
+        NERDTreeFind
+        wincmd p
+      endif
+    endfunction
+
+    function! NERDTreeFindFocus()
+        NERDTreeFind
+        wincmd p
+    endfunction
+
+    function! NERDTreeFindWithContext()
+        NERDTreeFind
+        "call nerdtree#ui_glue#upDir(0)
+        "call nerdtree#ui_glue#upDir(0)
+        "wincmd p
+        "NERDTreeFind
+        wincmd p
+    endfunction
+
+    " Highlight currently open buffer in NERDTree
+    " Note: If enabled make sure it is in an augroup
+    "autocmd BufEnter * call SyncTree()
+    ""===============================================
+    " Nerdtree sync keybound to F7
+    inoremap <F6> <Esc> :call NERDTreeFindFocus()<CR>
+    nnoremap <F6>  :call NERDTreeFindFocus()<CR>
+
+    " A hacky command to generate the tags for easytags in the current directory
+    " for all python and cpp files
+    "autocmd BufEnter * silent execute ":!ctags -a -f ~/.vimtags --fields=+l --c-kinds=+p --c++-kinds=+p $(for f in *.{cpp,h,py}; do echo $(readlink -f $f); done )"
+
+    function! SetCppOptions()
+        :call tagbar#autoopen(0)
+        if !IsNERDTreeOpen()
+            : NERDTree 
+            wincmd p
+        endif
+    endfunction
+
+    function! SetPythonOptions()
+        :call tagbar#autoopen(0)
+        if !IsNERDTreeOpen()
+            : NERDTree 
+            wincmd p
+        endif
+    endfunction
+
+    augroup Options
+        autocmd!
+        autocmd FileType cpp call SetCppOptions()
+        autocmd FileType python call SetPythonOptions()
+    augroup END
+
+    " All these are options to make easytags work better (to be deprecated by
+    " YCM)
+    augroup EasyTags
+        autocmd!
+        autocmd BufEnter *.cpp :HighlightTags
+        autocmd BufEnter *.h :HighlightTags
+        autocmd BufEnter *.py :HighlightTags
+    augroup END
+    ":let g:easytags_autorecurse = 1
+    set updatetime=1000
+    " Jump to first tag
+    set nocscopetag
+
+    " Make Nerd Tree prettier
+    let NERDTreeMinimalUI = 1
+    let NERDTreeDirArrows = 1
+
+    " Make Tagbar prettier
+    let g:tagbar_width = 80
+
+    " YCM options and keybindings
+    let g:ycm_global_ycm_extra_conf = '~/.ycm_extra_conf.py'
+    " GetDoc keybound to F1
+    inoremap <F1> <Esc> :YcmCompleter GetDoc<CR>
+    nnoremap <F1>  :YcmCompleter GetDoc<CR>
+    " GoToDeclaration keybound to F2
+    inoremap <F2> <Esc> :YcmCompleter GoToDeclaration<CR>
+    nnoremap <F2>  :YcmCompleter GoToDeclaration<CR>
+    " GoToDefinition keybound to F3
+    inoremap <F3> <Esc> :YcmCompleter GoToDefinition<CR>
+    nnoremap <F3>  :YcmCompleter GoToDefinition<CR>
+    " GoTo keybound to F4
+    inoremap <F4> <Esc> :YcmCompleter GoTo<CR>
+    nnoremap <F4>  :YcmCompleter GoTo<CR>
+    " GoToReferences keybound to F4
+    inoremap <F5> <Esc> :YcmCompleter GoToReferences<CR>
+    nnoremap <F5>  :YcmCompleter GoToReferences<CR>
+
+    " Format using clang
+    inoremap <F7> <Esc> :%!clang-format -style=LLVM<CR>
+    nnoremap <F7>  :%!clang-format -style=LLVM<CR>
+
+endif
+
+
+
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+"" COLORS:
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+set t_Co=256
+"colorscheme onedark
+"if !&diff
+"    "let g:zenburn_high_Contrast=1
+"    "let g:zenburn_alternate_Visual=1
+"    "colorscheme zenburn
+"    colorscheme onedark
+"else 
+"    colorscheme onedark
+"endif
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+
