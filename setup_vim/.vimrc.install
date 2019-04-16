@@ -125,8 +125,9 @@ if !&diff
     Plugin 'VundleVim/Vundle.vim'
     Plugin 'davidhalter/jedi-vim'
     Plugin 'majutsushi/tagbar'
-    Plugin 'xolox/vim-misc'
-    Plugin 'xolox/vim-easytags'
+    Plugin 'ludovicchabant/vim-gutentags'
+    "Plugin 'xolox/vim-misc'
+    "Plugin 'xolox/vim-easytags'
     Plugin 'scrooloose/nerdtree'
     Plugin 'Valloric/YouCompleteMe'
     Plugin 'rdnetto/YCM-Generator'
@@ -228,15 +229,7 @@ if !&diff && !&pvw
         autocmd FileType python call SetPythonOptions()
     augroup END
 
-    " All these are options to make easytags work better (to be deprecated by
-    " YCM)
-    augroup EasyTags
-        autocmd!
-        autocmd BufEnter *.cpp :HighlightTags
-        autocmd BufEnter *.h :HighlightTags
-        autocmd BufEnter *.py :HighlightTags
-    augroup END
-    ":let g:easytags_autorecurse = 1
+    " Maybe some tagging plugin uses this:
     set updatetime=1000
     " Jump to first tag
     set nocscopetag
@@ -250,6 +243,7 @@ if !&diff && !&pvw
 
     " YCM options and keybindings
     let g:ycm_global_ycm_extra_conf = '~/.ycm_extra_conf.py'
+
     " GetDoc keybound to F1
     inoremap <F1> <Esc> :YcmCompleter GetDoc<CR>
     nnoremap <F1>  :YcmCompleter GetDoc<CR>
