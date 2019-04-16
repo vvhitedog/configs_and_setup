@@ -83,7 +83,9 @@ augroup END
 " seem to happen.
 
 augroup qf_group
-  autocmd QuickFixCmdPost [^l]* nested cwindow
+  autocmd!
+  "autocmd QuickFixCmdPost [^l]* botright nested cwindow
+  autocmd QuickFixCmdPost [^l]* botright cwindow
 augroup END
 
 " This apparently fixes the bug when compiling C or CPP code where it jumps to 
