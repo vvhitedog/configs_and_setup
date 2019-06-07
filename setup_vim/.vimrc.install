@@ -255,9 +255,10 @@ if !&diff && !&pvw
     " GoTo keybound to F4
     inoremap <F4> <Esc> :YcmCompleter GoTo<CR>
     nnoremap <F4>  :YcmCompleter GoTo<CR>
-    " GoToReferences keybound to F4
-    inoremap <F5> <Esc> :YcmCompleter GoToReferences<CR>
-    nnoremap <F5>  :YcmCompleter GoToReferences<CR>
+    " GoToReferences keybound to F5, uses jedi#usages function directly to
+    " avoid weird errors
+    inoremap <F5> <Esc> :call jedi#usages()<CR>
+    nnoremap <F5>  :call jedi#usages()<CR>
     " Format using clang
     inoremap <F7> <Esc> :%!clang-format -style=LLVM<CR>
     nnoremap <F7>  :%!clang-format -style=LLVM<CR>
