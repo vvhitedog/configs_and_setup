@@ -127,9 +127,6 @@ if !&diff
     Plugin 'majutsushi/tagbar'
     Plugin 'ludovicchabant/vim-gutentags'
     Plugin 'heavenshell/vim-pydocstring'
-    Plugin 'scrooloose/nerdtree'
-    Plugin 'Valloric/YouCompleteMe'
-    Plugin 'rdnetto/YCM-Generator'
     Plugin 'vim-scripts/DoxygenToolkit.vim'
 endif
 
@@ -161,65 +158,13 @@ filetype plugin indent on    " required
 
 " Check that we are not in diff or preview window modes
 if !&diff && !&pvw 
-    "" Automate synchornization in nerdtree::
-    ""===============================================
-
-    " Check if NERDTree is open or active
-    function! IsNERDTreeOpen()        
-      return exists("t:NERDTreeBufName") && (bufwinnr(t:NERDTreeBufName) != -1)
-    endfunction
-
-    " Call NERDTreeFind iff NERDTree is active, current window contains a modifiable
-    " file, and we're not in vimdiff
-    function! SyncTree()
-      if &modifiable && IsNERDTreeOpen() && strlen(expand('%')) > 0 && !&diff && !&pvw
-        "NERDTreeFind %:p:h/../../
-        "wincmd p
-        NERDTreeFind
-        wincmd p
-      endif
-    endfunction
-
-    function! NERDTreeFindFocus()
-        NERDTreeFind
-        wincmd p
-    endfunction
-
-    function! NERDTreeFindWithContext()
-        NERDTreeFind
-        "call nerdtree#ui_glue#upDir(0)
-        "call nerdtree#ui_glue#upDir(0)
-        "wincmd p
-        "NERDTreeFind
-        wincmd p
-    endfunction
-
-    " Highlight currently open buffer in NERDTree
-    " Note: If enabled make sure it is in an augroup
-    "autocmd BufEnter * call SyncTree()
-    ""===============================================
-    " Nerdtree sync keybound to F7
-    inoremap <F6> <Esc> :call NERDTreeFindFocus()<CR>
-    nnoremap <F6>  :call NERDTreeFindFocus()<CR>
-
-    " A hacky command to generate the tags for easytags in the current directory
-    " for all python and cpp files
-    "autocmd BufEnter * silent execute ":!ctags -a -f ~/.vimtags --fields=+l --c-kinds=+p --c++-kinds=+p $(for f in *.{cpp,h,py}; do echo $(readlink -f $f); done )"
 
     function! SetCppOptions()
-        :call tagbar#autoopen(0)
-        if !IsNERDTreeOpen()
-            : NERDTree 
-            wincmd p
-        endif
+        :TagbarOpen
     endfunction
 
     function! SetPythonOptions()
-        :call tagbar#autoopen(0)
-        if !IsNERDTreeOpen()
-            : NERDTree 
-            wincmd p
-        endif
+        :TagbarOpen
     endfunction
 
     augroup Options
@@ -233,28 +178,21 @@ if !&diff && !&pvw
     " Jump to first tag
     set nocscopetag
 
-    " Make Nerd Tree prettier
-    let NERDTreeMinimalUI = 1
-    let NERDTreeDirArrows = 1
-
     " Make Tagbar prettier
     let g:tagbar_width = 80
 
-    " YCM options and keybindings
-    let g:ycm_global_ycm_extra_conf = '~/.ycm_extra_conf.py'
-
     " GetDoc keybound to F1
-    inoremap <F1> <Esc> :YcmCompleter GetDoc<CR>
-    nnoremap <F1>  :YcmCompleter GetDoc<CR>
+    inoremap <F1> <Esc> :call jedi#show_documentation()<CR>
+    nnoremap <F1>  :call jedi#show_documentation()<CR>
     " GoToDeclaration keybound to F2
-    inoremap <F2> <Esc> :YcmCompleter GoToDeclaration<CR>
-    nnoremap <F2>  :YcmCompleter GoToDeclaration<CR>
+    inoremap <F2> <Esc> :call jedi#goto()<CR>
+    nnoremap <F2>  :call jedi#goto()<CR>
     " GoToDefinition keybound to F3
-    inoremap <F3> <Esc> :YcmCompleter GoToDefinition<CR>
-    nnoremap <F3>  :YcmCompleter GoToDefinition<CR>
-    " GoTo keybound to F4
-    inoremap <F4> <Esc> :YcmCompleter GoTo<CR>
-    nnoremap <F4>  :YcmCompleter GoTo<CR>
+    inoremap <F3> <Esc> :call jedi#goto_assignments()<CR>
+    nnoremap <F3>  :call jedi#goto_assignments()<CR>
+    " F4: Find usages/occurrences in current file using vim-grep
+    inoremap <expr> <F4>  "<Esc> :lv /".expand('<cword>')."/j % \| :lwindow<CR>"
+    nnoremap <expr> <F4> ":lv /".expand('<cword>')."/j % \| :lwindow<CR>"
     " GoToReferences keybound to F5, uses jedi#usages function directly to
     " avoid weird errors
     inoremap <F5> <Esc> :call jedi#usages()<CR>
@@ -262,9 +200,6 @@ if !&diff && !&pvw
     " Format using clang
     inoremap <F7> <Esc> :%!clang-format -style=LLVM<CR>
     nnoremap <F7>  :%!clang-format -style=LLVM<CR>
-    " Find usages/occurrences in current file using vim-grep
-    inoremap <expr> <F8>  "<Esc> :lv /".expand('<cword>')."/j % \| :lwindow<CR>"
-    nnoremap <expr> <F8> ":lv /".expand('<cword>')."/j % \| :lwindow<CR>"
 
 endif
 
