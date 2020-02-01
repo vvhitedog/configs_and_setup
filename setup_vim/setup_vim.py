@@ -34,26 +34,6 @@ run_cmd("git clone https://github.com/VundleVim/Vundle.vim.git %s/Vundle.vim" % 
 # Install plugins via vundle
 run_cmd("vim +PluginInstall +qall")
 
-# Change into YCM
-ycmdir = os.path.join(vundledir,'YouCompleteMe')
-os.chdir(ycmdir)
+# Setup pydoc to use numpy-type docstring
+copfile('.multi.txt',os.path.join(vimdir,'/bundle/vim-pydocstring/template/pydocstring/multi.txt'))
 
-# Checkout submodule
-run_cmd("git submodule update --init --recursive")
-
-# Checkout branch that allows changing Translation units
-ycmddir = os.path.join(ycmdir,'third_party','ycmd')
-os.chdir(ycmddir)
-run_cmd("git remote add puremourning https://github.com/puremourning/ycmd-1")
-run_cmd("git fetch puremourning")
-run_cmd("git checkout -b alt-translation-unit remotes/puremourning/alt-translation-unit")
-
-# Build YCM
-os.chdir(ycmdir)
-run_cmd("git submodule update --init --recursive")
-run_cmd("./install.py --clang-completer")
-
-"""
-Note that this was all infered from https://github.com/Valloric/YouCompleteMe/issues/2796#issuecomment-333384095
-if you dont want the alternate TU version of YCM simply remove the branch checkout
-"""
