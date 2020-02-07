@@ -6,8 +6,8 @@ import sys
 from shutil import copyfile
 
 def mkdir(d):
-    if not os.path.exists(vimdir):
-        os.mkdir(vimdir)
+    if not os.path.exists(d):
+        os.mkdir(d)
 
 def run_cmd(cmd):
     ret = os.system(cmd)
