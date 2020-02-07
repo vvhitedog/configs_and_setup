@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--Written on Wed Jun 26 15:21:19 2019 by Qt Creator 4.11.0-beta1 (4.10.82)-->
+<externaltool id="vi">
+    <description>Opens the current file in vi</description>
+    <displayname>Edit with vi</displayname>
+    <category>Text</category>
+    <executable output="showinpane" error="showinpane" modifiesdocument="yes">
+        <path>terminator</path>
+        <arguments>-f -x vim &quot;%{CurrentDocument:FilePath}&quot; +%{CurrentDocument:Row}</arguments>
+        <workingdirectory>%{CurrentDocument:Path} </workingdirectory>
+    </executable>
+</externaltool>
