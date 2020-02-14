@@ -1,0 +1,13 @@
+azemoh.one-monokai
+cschlosser.doxdocgen
+donjayamanne.githistory
+dracula-theme.theme-dracula
+mitaki28.vscode-clang
+ms-python.python
+ms-vscode.cmake-tools
+ms-vscode.cpptools
+njpwerner.autodocstring
+twxs.cmake
+vscodevim.vim
+xaver.clang-format
+zhuangtongfa.material-theme

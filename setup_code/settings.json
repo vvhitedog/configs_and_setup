@@ -1,0 +1,15 @@
+{
+    "cmake.configureOnOpen": true,
+    "window.zoomLevel": 0,
+    "workbench.colorTheme": "One Monokai",
+    "[cpp]": {
+        "editor.defaultFormatter": "xaver.clang-format"
+    },
+    "git.autofetch": true,
+    "python.linting.pylintArgs": [
+        "--extension-pkg-whitelist=numpy",
+        "--disable=C"
+    ],
+    "python.linting.pylintCategorySeverity.convention": "Hint",
+    "diffEditor.ignoreTrimWhitespace": false
+}

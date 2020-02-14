@@ -1,0 +1,60 @@
+// Place your key bindings in this file to override the defaultsauto[]
+[
+    {
+        "key": "ctrl+shift+t",
+        "command": "-workbench.action.reopenClosedEditor"
+    },
+    {
+        "key": "ctrl+t",
+        "command": "-workbench.action.showAllSymbols"
+    },
+    {
+        "key": "alt+q",
+        "command": "workbench.action.closePanel"
+    },
+    {
+        "key": "alt+left",
+        "command": "workbench.action.navigateBack"
+    },
+    {
+        "key": "ctrl+alt+-",
+        "command": "-workbench.action.navigateBack"
+    },
+    {
+        "key": "ctrl+t",
+        "command": "-extension.vim_ctrl+t",
+        "when": "editorTextFocus && vim.active && vim.use<C-t> && !inDebugRepl"
+    },
+    {
+        "key": "ctrl+shift+x",
+        "command": "workbench.action.maximizeEditor"
+    },
+    {
+        "key": "ctrl+alt+x",
+        "command": "workbench.action.evenEditorWidths"
+    },
+    {
+        "key": "f9",
+        "command": "workbench.action.toggleMaximizedPanel"
+    },
+    {
+        "key": "f6",
+        "command": "python.runtests"
+    },
+    {
+        "key": "ctrl+t",
+        "command": "extension.vim_ctrl+t"
+    },
+    {
+        "key": "ctrl+k ctrl+t",
+        "command": "-workbench.action.selectTheme"
+    },
+    {
+        "key": "ctrl+shift+n",
+        "command": "workbench.action.showAllSymbols"
+    },
+    {
+        "key": "ctrl+shift+n",
+        "command": "-workbench.action.newWindow"
+    }
+]
