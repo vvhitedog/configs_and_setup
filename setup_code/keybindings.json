@@ -42,10 +42,6 @@
         "command": "python.runtests"
     },
     {
-        "key": "ctrl+t",
-        "command": "extension.vim_ctrl+t"
-    },
-    {
         "key": "ctrl+k ctrl+t",
         "command": "-workbench.action.selectTheme"
     },
@@ -56,5 +52,42 @@
     {
         "key": "ctrl+shift+n",
         "command": "-workbench.action.newWindow"
+    },
+    {
+        "key": "ctrl+]",
+        "command": "-editor.action.indentLines",
+        "when": "editorTextFocus && !editorReadonly"
+    },
+    {
+        "key": "ctrl+]",
+        "command": "-extension.vim_ctrl+]",
+        "when": "editorTextFocus && vim.active && vim.use<C-]> && !inDebugRepl"
+    },
+    {
+        "key": "f2",
+        "command": "editor.action.revealDefinition",
+        "when": "editorHasDefinitionProvider && editorTextFocus && !isInEmbeddedEditor"
+    },
+    {
+        "key": "f12",
+        "command": "-editor.action.revealDefinition",
+        "when": "editorHasDefinitionProvider && editorTextFocus && !isInEmbeddedEditor"
+    },
+    {
+        "key": "alt+right",
+        "command": "workbench.action.navigateForward"
+    },
+    {
+        "key": "ctrl+shift+-",
+        "command": "-workbench.action.navigateForward"
+    },
+    {
+        "key": "ctrl+o",
+        "command": "-workbench.action.files.openLocalFile",
+        "when": "remoteFileDialogVisible"
+    },
+    {
+        "key": "ctrl+o",
+        "command": "-workbench.action.files.openFile"
     }
 ]
