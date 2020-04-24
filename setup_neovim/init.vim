@@ -90,7 +90,10 @@ call plug#begin(stdpath('data') . '/plugged')
 if !&diff
     Plug 'heavenshell/vim-pydocstring'
     Plug 'vim-scripts/DoxygenToolkit.vim'
-    Plug 'neoclide/coc.nvim'
+    Plug 'neoclide/coc.nvim', { 'branch': 'release' }
+    Plug 'junegunn/fzf', { 'do': { -> fzf#install() } }
+    Plug 'junegunn/fzf.vim'
+    Plug 'vim-scripts/a.vim'
 endif
 
 " These are colorschemes so okay to have in diff
@@ -161,25 +164,45 @@ function! FloatScroll(forward) abort
   return ''
 endfunction
 
+fun! ShowFuncName()
+  return getline(search("^[^ \t#/]\\{2}.*[^:]\s*$", 'bWn'))
+endfun
+
+"fun! ShowFuncName()
+"  let lnum = line(".")
+"  let col = col(".")
+"  echohl ModeMsg
+"  echo getline(search("^[^ \t#/]\\{2}.*[^:]\s*$", 'bW'))
+"  echohl None
+"  call search("\\%" . lnum . "l" . "\\%" . col . "c")
+"endfun
+
 " Check that we are not in diff or preview window modes
 if !&diff && !&pvw 
 
     " Jump to first tag
     set nocscopetag
 
+    " F5: Find usages/occurrences using rg (r-grep)
+    inoremap <expr> <F5>  "<Esc> :Rg ".expand('<cword>')."<CR>"
+    nnoremap <expr> <F5> ":Rg ".expand('<cword>')."<CR>"
+
     " F4: Find usages/occurrences in current file using vim-grep
     inoremap <expr> <F4>  "<Esc> :lv /".expand('<cword>')."/j % \| :lwindow<CR>"
     nnoremap <expr> <F4> ":lv /".expand('<cword>')."/j % \| :lwindow<CR>"
     " Format using clang
-    inoremap <F7> <Esc> :%!clang-format -style=LLVM<CR>
-    nnoremap <F7>  :%!clang-format -style=LLVM<CR>
+    inoremap <F7> <Esc> :%!clang-format <CR>
+    nnoremap <F7>  :%!clang-format <CR>
 
+    nmap <silent> <C-l> <Plug>(coc-declaration)
     nmap <silent> <C-j> <Plug>(coc-definition)
     nmap <silent> <C-k> <Plug>(coc-references)
     nn <silent> K :call CocActionAsync('doHover')<cr>
 
     nmap <silent> <C-n> :CocList symbols<cr>
-    nmap <silent> <C-m> :CocList outline<cr>
+    nnoremap <silent> <C-m> :CocList outline<cr>
+    nmap <silent> <C-h> :CocList --interactive symbols -kind class<cr>
+    nmap <silent> <C-f> :CocList files<cr>
 
     " Use <cr> to confirm completion, `<C-g>u` means break undo chain at current
     " position. Coc only does snippet and additional edit on confirm.
@@ -230,7 +253,23 @@ if !&diff && !&pvw
     " Symbol renaming.
     nmap <leader>r <Plug>(coc-rename)
 
+    " coc rename is rather broken, use clang-rename.py instead:
+    "noremap <leader>cr :pyf ~/.local/bin/clang-rename.py<cr>
+
 endif
+
+"inoremap <F8> <Esc> :setlocal winheight=60 <CR>
+"nnoremap <F8>  :setlocal winheight=60 <CR>
+
+set previewheight=60
+au BufEnter ?* call PreviewHeightWorkAround()
+func PreviewHeightWorkAround()
+    if &previewwindow
+        exec 'setlocal winheight='.&previewheight
+    else
+        exec 'setlocal winheight=1'
+    endif
+endfunc
 
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 "" COLORS AND DISPLAY:
@@ -238,8 +277,16 @@ endif
 set termguicolors
 colorscheme onedark
 
-" Make a nicer statusline
+autocmd FileType cpp :setlocal statusline=%t[%{strlen(&fenc)?&fenc:'none'},%{&ff}]%h%m%r%y[%{ShowFuncName()}]%=%c,%l/%L\ %P
+
 set statusline=%t[%{strlen(&fenc)?&fenc:'none'},%{&ff}]%h%m%r%y%=%c,%l/%L\ %P
+"set statusline+=%{ShowFuncName()}
+"if &filetype == 'cpp'
+"  set statusline+=%=%{ShowFuncName()}
+"endif
+"set statusline+=%t[%{strlen(&fenc)?&fenc:'none'},%{&ff}]%h%m%r%y%=%c,%l/%L\ %P
+"set statusline+=%=%c,%l/%L\ %P
+set statusline+=%c,%l/%L\ %P
 hi StatusLine guifg=#282c34 guibg=#abb2bf
 hi StatusLineNC guifg=#abb2bf guibg=#4b5263
 
