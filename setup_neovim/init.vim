@@ -207,7 +207,8 @@ if !&diff && !&pvw
 
     " Open outline tagbar (note vista is horrible for keeping jump-lists
     " sane.)
-    nmap <M-o> :TagbarToggle<cr>
+    nmap <M-o> :TagbarOpen j<cr>:TagbarOpen j<cr>
+    nmap <M-t> :TagbarToggle<cr>
 
 endif
 
