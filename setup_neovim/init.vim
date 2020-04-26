@@ -95,7 +95,7 @@ if !&diff
     Plug 'junegunn/fzf.vim'
     Plug 'vim-scripts/a.vim'
     Plug 'liuchengxu/vista.vim'
-    Plug 'majutsushi/tagbar'
+    Plug 'vvhitedog/tagbar'
 endif
 
 " These are colorschemes so okay to have in diff
