@@ -94,6 +94,8 @@ if !&diff
     Plug 'junegunn/fzf', { 'do': { -> fzf#install() } }
     Plug 'junegunn/fzf.vim'
     Plug 'vim-scripts/a.vim'
+    Plug 'liuchengxu/vista.vim'
+    Plug 'majutsushi/tagbar'
 endif
 
 " These are colorschemes so okay to have in diff
@@ -135,47 +137,10 @@ function! s:check_back_space() abort
 endfunction
 
 
-function! FloatScroll(forward) abort
-  let float = coc#util#get_float()
-  if !float | return '' | endif
-  let buf = nvim_win_get_buf(float)
-  let buf_height = nvim_buf_line_count(buf)
-  let win_height = nvim_win_get_height(float)
-  if buf_height < win_height | return '' | endif
-  let pos = nvim_win_get_cursor(float)
-  if a:forward
-    if pos[0] == 1
-      let pos[0] += 3 * win_height / 4
-    elseif pos[0] + win_height / 2 + 1 < buf_height
-      let pos[0] += win_height / 2 + 1
-    else
-      let pos[0] = buf_height
-    endif
-  else
-    if pos[0] == buf_height
-      let pos[0] -= 3 * win_height / 4
-    elseif pos[0] - win_height / 2 + 1  > 1
-      let pos[0] -= win_height / 2 + 1
-    else
-      let pos[0] = 1
-    endif
-  endif
-  call nvim_win_set_cursor(float, pos)
-  return ''
-endfunction
-
-fun! ShowFuncName()
-  return getline(search("^[^ \t#/]\\{2}.*[^:]\s*$", 'bWn'))
+fun! GetFuncName()
+  "return getline(search("^[^ \t#/]\\{2}.*[^:]\s*$", 'bWn'))
+  return getline(search("^*[^ \t#/]\\{2}.*[^:]\s*$", 'bWn'))
 endfun
-
-"fun! ShowFuncName()
-"  let lnum = line(".")
-"  let col = col(".")
-"  echohl ModeMsg
-"  echo getline(search("^[^ \t#/]\\{2}.*[^:]\s*$", 'bW'))
-"  echohl None
-"  call search("\\%" . lnum . "l" . "\\%" . col . "c")
-"endfun
 
 " Check that we are not in diff or preview window modes
 if !&diff && !&pvw 
@@ -197,10 +162,11 @@ if !&diff && !&pvw
     nmap <silent> <C-l> <Plug>(coc-declaration)
     nmap <silent> <C-j> <Plug>(coc-definition)
     nmap <silent> <C-k> <Plug>(coc-references)
-    nn <silent> K :call CocActionAsync('doHover')<cr>
 
+    " Use Vista finder in place of coclist-outline as it is nicer
+    "nnoremap <silent> <C-m> :CocList outline<cr>
+    nnoremap <silent> <C-m> :Vista finder<cr>
     nmap <silent> <C-n> :CocList symbols<cr>
-    nnoremap <silent> <C-m> :CocList outline<cr>
     nmap <silent> <C-h> :CocList --interactive symbols -kind class<cr>
     nmap <silent> <C-f> :CocList files<cr>
 
@@ -213,40 +179,16 @@ if !&diff && !&pvw
       imap <expr> <cr> pumvisible() ? "\<C-y>" : "\<C-g>u\<CR>"
     endif
 
-		function! FloatScroll(forward) abort
-			let float = coc#util#get_float()
-			if !float | return '' | endif
-			let buf = nvim_win_get_buf(float)
-			let buf_height = nvim_buf_line_count(buf)
-			let win_height = nvim_win_get_height(float)
-			if buf_height < win_height | return '' | endif
-			let pos = nvim_win_get_cursor(float)
-			if a:forward
-				if pos[0] == 1
-					let pos[0] += 3 * win_height / 4
-				elseif pos[0] + win_height / 2 + 1 < buf_height
-					let pos[0] += win_height / 2 + 1
-				else
-					let pos[0] = buf_height
-				endif
-			else
-				if pos[0] == buf_height
-					let pos[0] -= 3 * win_height / 4
-				elseif pos[0] - win_height / 2 + 1  > 1
-					let pos[0] -= win_height / 2 + 1
-				else
-					let pos[0] = 1
-				endif
-			endif
-			call nvim_win_set_cursor(float, pos)
-			return ''
-		endfunction
-
-		inoremap <silent><expr> <down> coc#util#has_float() ? FloatScroll(1) : "\<down>"
-		inoremap <silent><expr>  <up>  coc#util#has_float() ? FloatScroll(0) :  "\<up>"
+    function! HelpWithFocus()
+      call CocAction('doHover')
+      call coc#util#float_jump()
+    endfunction
+    nn <silent> K :call HelpWithFocus()<cr>
 
     nnoremap <expr><down> coc#util#has_float() ? coc#util#float_scroll(1) : "\<down>"
     nnoremap <expr><up> coc#util#has_float() ? coc#util#float_scroll(0) : "\<up>"
+
+    nn <silent> K :call HelpWithFocus()<cr>
 
     inoremap <silent><expr> <c-space> coc#refresh()
 
@@ -256,10 +198,24 @@ if !&diff && !&pvw
     " coc rename is rather broken, use clang-rename.py instead:
     "noremap <leader>cr :pyf ~/.local/bin/clang-rename.py<cr>
 
+    " Executive used when opening vista sidebar without specifying it.
+    " See all the avaliable executives via `:echo g:vista#executives`.
+    let g:vista_default_executive = 'coc'
+
+    " Ensure you have installed some decent font to show these pretty symbols, then you can enable icon for the kind.
+    let g:vista#renderer#enable_icon = 1
+
+    " Open outline tagbar (note vista is horrible for keeping jump-lists
+    " sane.)
+    nmap <M-o> :TagbarToggle<cr>
+
 endif
 
-"inoremap <F8> <Esc> :setlocal winheight=60 <CR>
-"nnoremap <F8>  :setlocal winheight=60 <CR>
+"filetype plugin indent on
+
+" In the quickfix window, <CR> is used to jump to the error under the
+" cursor, so undefine the mapping there.
+autocmd BufReadPost quickfix nnoremap <buffer> <CR> <CR>
 
 set previewheight=60
 au BufEnter ?* call PreviewHeightWorkAround()
@@ -277,16 +233,8 @@ endfunc
 set termguicolors
 colorscheme onedark
 
-autocmd FileType cpp :setlocal statusline=%t[%{strlen(&fenc)?&fenc:'none'},%{&ff}]%h%m%r%y[%{ShowFuncName()}]%=%c,%l/%L\ %P
-
 set statusline=%t[%{strlen(&fenc)?&fenc:'none'},%{&ff}]%h%m%r%y%=%c,%l/%L\ %P
-"set statusline+=%{ShowFuncName()}
-"if &filetype == 'cpp'
-"  set statusline+=%=%{ShowFuncName()}
-"endif
-"set statusline+=%t[%{strlen(&fenc)?&fenc:'none'},%{&ff}]%h%m%r%y%=%c,%l/%L\ %P
-"set statusline+=%=%c,%l/%L\ %P
-set statusline+=%c,%l/%L\ %P
+
 hi StatusLine guifg=#282c34 guibg=#abb2bf
 hi StatusLineNC guifg=#abb2bf guibg=#4b5263
 
