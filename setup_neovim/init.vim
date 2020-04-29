@@ -94,7 +94,6 @@ if !&diff
     Plug 'junegunn/fzf', { 'do': { -> fzf#install() } }
     Plug 'junegunn/fzf.vim'
     Plug 'vim-scripts/a.vim'
-    Plug 'liuchengxu/vista.vim'
     Plug 'vvhitedog/tagbar'
 endif
 
@@ -103,6 +102,7 @@ Plug 'morhetz/gruvbox'
 Plug 'tyrannicaltoucan/vim-quantum'
 Plug 'joshdick/onedark.vim'
 Plug 'bfrg/vim-cpp-modern'
+"Plug 'rafi/awesome-vim-colorschemes'
 
 " Initialize plugin system
 call plug#end()
@@ -161,11 +161,9 @@ if !&diff && !&pvw
 
     nmap <silent> <C-l> <Plug>(coc-declaration)
     nmap <silent> <C-j> <Plug>(coc-definition)
-    nmap <silent> <C-k> <Plug>(coc-references)
+    nmap <silent> <C-k> :TagbarClose<cr><Plug>(coc-references)
 
-    " Use Vista finder in place of coclist-outline as it is nicer
-    "nnoremap <silent> <C-m> :CocList outline<cr>
-    nnoremap <silent> <C-m> :Vista finder<cr>
+    nnoremap <silent> <C-m> :CocList outline<cr>
     nmap <silent> <C-n> :CocList symbols<cr>
     nmap <silent> <C-h> :CocList --interactive symbols -kind class<cr>
     nmap <silent> <C-f> :CocList files<cr>
@@ -209,6 +207,8 @@ if !&diff && !&pvw
     " sane.)
     nmap <M-o> :TagbarOpen j<cr>:TagbarOpen j<cr>
     nmap <M-t> :TagbarToggle<cr>
+    
+    let g:tagbar_ctags_bin = '/home/mgara/.local/bin/ctags'
 
 endif
 
@@ -236,8 +236,10 @@ colorscheme onedark
 
 set statusline=%t[%{strlen(&fenc)?&fenc:'none'},%{&ff}]%h%m%r%y%=%c,%l/%L\ %P
 
+hi TagbarVisibilityProtected guifg=orange 
 hi StatusLine guifg=#282c34 guibg=#abb2bf
 hi StatusLineNC guifg=#abb2bf guibg=#4b5263
+
 
 "If the Pmenu is messed up try setting colors manually:
 "highlight PMenuSel cterm=bold ctermbg=Green ctermfg=None
