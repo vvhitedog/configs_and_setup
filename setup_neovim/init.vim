@@ -145,6 +145,10 @@ endfun
 " Check that we are not in diff or preview window modes
 if !&diff && !&pvw 
 
+    " remap method jumps to bring you to the function name instead of brackets
+    nnoremap [m [m{jf(b
+    nnoremap ]m }]m{jf(b
+
     " Jump to first tag
     set nocscopetag
 
@@ -159,14 +163,30 @@ if !&diff && !&pvw
     inoremap <F7> <Esc> :%!clang-format <CR>
     nnoremap <F7>  :%!clang-format <CR>
 
-    nmap <silent> <C-l> <Plug>(coc-declaration)
-    nmap <silent> <C-j> <Plug>(coc-definition)
+    nmap <silent> <C-l> :TagbarClose<cr><Plug>(coc-declaration)
+    nmap <silent> <C-j> :TagbarClose<cr><Plug>(coc-definition)
     nmap <silent> <C-k> :TagbarClose<cr><Plug>(coc-references)
 
-    nnoremap <silent> <C-m> :CocList outline<cr>
+    nnoremap <silent> <M-m> :CocList outline<cr>
     nmap <silent> <C-n> :CocList symbols<cr>
     nmap <silent> <C-h> :CocList --interactive symbols -kind class<cr>
     nmap <silent> <C-f> :CocList files<cr>
+
+    " follow inheritance
+    " basese
+    nn <silent> <M-b> :call CocLocations('ccls','$ccls/inheritance')<cr>
+    " bases of up to 3 levels
+    nn <silent> <M-B> :call CocLocations('ccls','$ccls/inheritance',{'levels':3})<cr>
+    " derived
+    nn <silent> <M-d> :call CocLocations('ccls','$ccls/inheritance',{'derived':v:true})<cr>
+    " derived of up to 3 levels
+    nn <silent> <M-D> :call CocLocations('ccls','$ccls/inheritance',{'derived':v:true,'levels':3})<cr>
+
+    " fine-graned references, callee vs caller
+    " caller
+    nn <silent> <M-x>c :call CocLocations('ccls','$ccls/call')<cr>
+    " callee
+    nn <silent> <M-x>C :call CocLocations('ccls','$ccls/call',{'callee':v:true})<cr>
 
     " Use <cr> to confirm completion, `<C-g>u` means break undo chain at current
     " position. Coc only does snippet and additional edit on confirm.
@@ -194,7 +214,7 @@ if !&diff && !&pvw
     nmap <leader>r <Plug>(coc-rename)
 
     " coc rename is rather broken, use clang-rename.py instead:
-    "noremap <leader>cr :pyf ~/.local/bin/clang-rename.py<cr>
+    noremap <leader>cr :pyf ~/.local/bin/clang-rename.py<cr>
 
     " Executive used when opening vista sidebar without specifying it.
     " See all the avaliable executives via `:echo g:vista#executives`.
