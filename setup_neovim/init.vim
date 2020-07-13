@@ -136,12 +136,6 @@ function! s:check_back_space() abort
   return !col || getline('.')[col - 1]  =~# '\s'
 endfunction
 
-
-fun! GetFuncName()
-  "return getline(search("^[^ \t#/]\\{2}.*[^:]\s*$", 'bWn'))
-  return getline(search("^*[^ \t#/]\\{2}.*[^:]\s*$", 'bWn'))
-endfun
-
 " Check that we are not in diff or preview window modes
 if !&diff && !&pvw 
 
@@ -153,8 +147,8 @@ if !&diff && !&pvw
     set nocscopetag
 
     " F5: Find usages/occurrences using rg (r-grep)
-    inoremap <expr> <F5>  "<Esc> :Rg ".expand('<cword>')."<CR>"
-    nnoremap <expr> <F5> ":Rg ".expand('<cword>')."<CR>"
+    inoremap <expr> <F5>  "<Esc> :sil grep ".expand('<cword>')." .<CR>:cw<CR>"
+    nnoremap <expr> <F5> ":sil grep ".expand('<cword>')." . <CR>:cw<CR>"
 
     " F4: Find usages/occurrences in current file using vim-grep
     inoremap <expr> <F4>  "<Esc> :lv /".expand('<cword>')."/j % \| :lwindow<CR>"
@@ -180,7 +174,11 @@ if !&diff && !&pvw
     " derived
     nn <silent> <M-d> :call CocLocations('ccls','$ccls/inheritance',{'derived':v:true})<cr>
     " derived of up to 3 levels
-    nn <silent> <M-D> :call CocLocations('ccls','$ccls/inheritance',{'derived':v:true,'levels':3})<cr>
+    nn <silent> <M-D> :call CocLocations('ccls','$ccls/inheritance',{'derived':v:true,'levels':3,'qualified':v:false})<cr>
+
+    nn <silent> <M-e> :call CocLocations('ccls','$ccls/inheritance',{'hierarchy':v:true})<cr>
+
+    nn <silent> <M-l> :execute '! xdg-open $(echo https://github.com/omnisci/omniscidb-internal/blob/$(git rev-parse --abbrev-ref HEAD)/' . @% . '\#L' . line(".") . ')'<cr>
 
     " fine-graned references, callee vs caller
     " caller
@@ -216,19 +214,45 @@ if !&diff && !&pvw
     " coc rename is rather broken, use clang-rename.py instead:
     noremap <leader>cr :pyf ~/.local/bin/clang-rename.py<cr>
 
-    " Executive used when opening vista sidebar without specifying it.
-    " See all the avaliable executives via `:echo g:vista#executives`.
-    let g:vista_default_executive = 'coc'
-
-    " Ensure you have installed some decent font to show these pretty symbols, then you can enable icon for the kind.
-    let g:vista#renderer#enable_icon = 1
-
     " Open outline tagbar (note vista is horrible for keeping jump-lists
     " sane.)
     nmap <M-o> :TagbarOpen j<cr>:TagbarOpen j<cr>
     nmap <M-t> :TagbarToggle<cr>
     
     let g:tagbar_ctags_bin = '/home/mgara/.local/bin/ctags'
+
+    function GitDiff(base)
+       if filereadable(@%)
+         wincmd n
+         execute 'r!git diff ' a:base ' #'
+         set ft=diff
+         normal ggdd
+         w! /tmp/nvim-git-diff.tmp
+       endif
+    endfunction
+
+    nmap <M-g> :call GitDiff("")<cr>
+    nmap <M-G> :call GitDiff("origin/HEAD")<cr>
+
+    function GitBlame()
+       if filereadable(@%)
+         wincmd n
+         r!git blame #
+         set ft=cpp
+         normal ggdd
+         w! /tmp/nvim-git-blame.tmp
+       endif
+    endfunction
+
+    nmap <M-h> :call GitBlame()<cr>
+
+    function FifoMake()
+      call system('echo make > /tmp/fifo')
+    endfunction
+
+    nmap <M-k> :call FifoMake()<cr>
+
+    let &gp="rg -n $* /dev/null"
 
 endif
 
