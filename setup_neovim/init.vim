@@ -33,6 +33,10 @@ set noswapfile
 "Colouring
 set background=dark
 
+"Do not yank when putting in visual mode
+:map <leader>y "0y
+:map <leader>p "0p
+
 "Ignore case on searches
 set ic
 
@@ -91,11 +95,15 @@ if !&diff
     Plug 'heavenshell/vim-pydocstring'
     Plug 'vim-scripts/DoxygenToolkit.vim'
     Plug 'neoclide/coc.nvim', { 'branch': 'release' }
-    Plug 'junegunn/fzf', { 'do': { -> fzf#install() } }
-    Plug 'junegunn/fzf.vim'
+    "Plug 'neoclide/coc.nvim'
     Plug 'vim-scripts/a.vim'
     Plug 'vvhitedog/tagbar'
+    Plug 'dhruvasagar/vim-table-mode'
 endif
+
+" fzf plugin below is just a hastle:
+"Plug 'junegunn/fzf', { 'do': { -> fzf#install() } }
+"Plug 'junegunn/fzf.vim'
 
 " These are colorschemes so okay to have in diff
 Plug 'morhetz/gruvbox'
@@ -147,8 +155,8 @@ if !&diff && !&pvw
     set nocscopetag
 
     " F5: Find usages/occurrences using rg (r-grep)
-    inoremap <expr> <F5>  "<Esc> :sil grep ".expand('<cword>')." .<CR>:cw<CR>"
-    nnoremap <expr> <F5> ":sil grep ".expand('<cword>')." . <CR>:cw<CR>"
+    inoremap <expr> <F5>  "<Esc> :sil grep ".expand('<cword>')." .<CR>:botr cw<CR>"
+    nnoremap <expr> <F5> ":sil grep ".expand('<cword>')." . <CR>:botr cw<CR>"
 
     " F4: Find usages/occurrences in current file using vim-grep
     inoremap <expr> <F4>  "<Esc> :lv /".expand('<cword>')."/j % \| :lwindow<CR>"
@@ -179,6 +187,8 @@ if !&diff && !&pvw
     nn <silent> <M-e> :call CocLocations('ccls','$ccls/inheritance',{'hierarchy':v:true})<cr>
 
     nn <silent> <M-l> :execute '! xdg-open $(echo https://github.com/omnisci/omniscidb-internal/blob/$(git rev-parse --abbrev-ref HEAD)/' . @% . '\#L' . line(".") . ')'<cr>
+
+    nn <silent> <M-c> :sil execute '! echo $(readlink -f ' . @% . '):' . line(".") . ' \| tr -d "\n" \| xsel -ib'<cr>
 
     " fine-graned references, callee vs caller
     " caller
@@ -214,6 +224,9 @@ if !&diff && !&pvw
     " coc rename is rather broken, use clang-rename.py instead:
     noremap <leader>cr :pyf ~/.local/bin/clang-rename.py<cr>
 
+    " help with view diffs 
+    nmap <C-b> :pyf ~/.local/bin/git-diff3-view.py<cr>
+
     " Open outline tagbar (note vista is horrible for keeping jump-lists
     " sane.)
     nmap <M-o> :TagbarOpen j<cr>:TagbarOpen j<cr>
@@ -231,8 +244,25 @@ if !&diff && !&pvw
        endif
     endfunction
 
+    function GitDiffWin(base)
+       if filereadable(@%)
+         wincmd n
+         execute 'r!git show ' . trim(a:base) . ':' . trim(bufname(winbufnr(winnr('#'))))
+         set ft=cpp
+         normal ggdd
+         w! /tmp/nvim-git-show.tmp
+         wincmd H
+         execute 'windo diffthis'
+       endif
+    endfunction
+
     nmap <M-g> :call GitDiff("")<cr>
     nmap <M-G> :call GitDiff("origin/HEAD")<cr>
+
+    nmap <M-f> :call GitDiffWin("")<cr>
+    nmap <M-F> :call GitDiffWin("origin/HEAD")<cr>
+
+    nmap <C-q> :bd<cr>:bd<cr>
 
     function GitBlame()
        if filereadable(@%)
