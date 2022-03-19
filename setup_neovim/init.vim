@@ -94,19 +94,14 @@ call plug#begin(stdpath('data') . '/plugged')
 if !&diff
     Plug 'heavenshell/vim-pydocstring'
     Plug 'vim-scripts/DoxygenToolkit.vim'
+    Plug 'neoclide/coc.nvim', { 'branch': 'release', 'tag': 'v0.0.76' }
     "Plug 'neoclide/coc.nvim', { 'branch': 'release' }
-    Plug 'neoclide/coc.nvim', { 'tag' : 'v0.0.76' }
-    "Plug 'neoclide/coc.nvim'
     Plug 'vim-scripts/a.vim'
     Plug 'vvhitedog/tagbar'
     Plug 'dhruvasagar/vim-table-mode'
     Plug 'davidhalter/jedi-vim'
     Plug 'jremmen/vim-ripgrep'
 endif
-
-" fzf plugin below is just a hastle:
-"Plug 'junegunn/fzf', { 'do': { -> fzf#install() } }
-"Plug 'junegunn/fzf.vim'
 
 " These are colorschemes so okay to have in diff
 Plug 'morhetz/gruvbox'
@@ -146,6 +141,9 @@ function! s:check_back_space() abort
   let col = col('.') - 1
   return !col || getline('.')[col - 1]  =~# '\s'
 endfunction
+
+" python related
+let g:jedi#goto_command = "<C-j>"
 
 " Check that we are not in diff or preview window modes
 if !&diff && !&pvw 
@@ -410,3 +408,10 @@ endif
 
 "If the Pmenu is messed up try setting colors manually:
 "highlight PMenuSel cterm=bold ctermbg=Green ctermfg=None
+
+" setup doq
+let g:pydocstring_doq_path = '~/.local/bin/doq'
+let g:pydocstring_formatter = 'numpy'
+
+" colorcolumn
+set colorcolumn=80
