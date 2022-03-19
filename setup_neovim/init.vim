@@ -94,11 +94,14 @@ call plug#begin(stdpath('data') . '/plugged')
 if !&diff
     Plug 'heavenshell/vim-pydocstring'
     Plug 'vim-scripts/DoxygenToolkit.vim'
-    Plug 'neoclide/coc.nvim', { 'branch': 'release' }
+    "Plug 'neoclide/coc.nvim', { 'branch': 'release' }
+    Plug 'neoclide/coc.nvim', { 'tag' : 'v0.0.76' }
     "Plug 'neoclide/coc.nvim'
     Plug 'vim-scripts/a.vim'
     Plug 'vvhitedog/tagbar'
     Plug 'dhruvasagar/vim-table-mode'
+    Plug 'davidhalter/jedi-vim'
+    Plug 'jremmen/vim-ripgrep'
 endif
 
 " fzf plugin below is just a hastle:
@@ -256,6 +259,29 @@ if !&diff && !&pvw
        endif
     endfunction
 
+    function GitDiffWin2(base1,base2)
+       if filereadable(@%)
+
+         wincmd n
+         execute 'r!git show ' . trim(a:base1) . ':' . trim(bufname(winbufnr(winnr('#'))))
+         set ft=cpp
+         normal ggdd
+         w! /tmp/nvim-git-show-1.tmp
+         wincmd H
+         wincmd w
+
+         wincmd n
+         execute 'r!git show ' . trim(a:base2) . ':' . trim(bufname(winbufnr(winnr('#'))))
+         set ft=cpp
+         normal ggdd
+         w! /tmp/nvim-git-show-2.tmp
+         wincmd H
+         wincmd w
+
+         execute 'windo diffthis'
+       endif
+    endfunction
+
     nmap <M-g> :call GitDiff("")<cr>
     nmap <M-G> :call GitDiff("origin/HEAD")<cr>
 
@@ -266,11 +292,13 @@ if !&diff && !&pvw
 
     function GitBlame()
        if filereadable(@%)
+         let lineno = line('.')
          wincmd n
          r!git blame #
          set ft=cpp
          normal ggdd
          w! /tmp/nvim-git-blame.tmp
+         execute 'normal ' . lineno . 'G'
        endif
     endfunction
 
@@ -283,6 +311,14 @@ if !&diff && !&pvw
     nmap <M-k> :call FifoMake()<cr>
 
     let &gp="rg -n $* /dev/null"
+
+    nmap <M-1> 1gt
+    nmap <M-2> 2gt
+    nmap <M-3> 3gt
+    nmap <M-4> 4gt
+    nmap <M-5> 5gt
+    nmap <M-6> 6gt
+    nmap <M-7> 7gt
 
 endif
 
@@ -313,7 +349,64 @@ set statusline=%t[%{strlen(&fenc)?&fenc:'none'},%{&ff}]%h%m%r%y%=%c,%l/%L\ %P
 hi TagbarVisibilityProtected guifg=orange 
 hi StatusLine guifg=#282c34 guibg=#abb2bf
 hi StatusLineNC guifg=#abb2bf guibg=#4b5263
+hi TabLine guifg=#14161a guibg=#676b73
+hi TabLineSel guifg=#282c34 guibg=#abb2bf
+hi TabLineFill guifg=#14161a guibg=#676b73
+hi Title guibg=#282c34 guifg=#abb2bf
+hi TabLineNC guibg=#dae2f2 guifg=#74a0f7
 
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+"" FIX TABLLINE TO SHOW NUMBERS:
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+" Rename tabs to show tab number.
+" (Based on http://stackoverflow.com/questions/5927952/whats-implementation-of-vims-default-tabline-function)
+" taken from https://superuser.com/a/477221/734404
+if exists("+showtabline")
+    function! MyTabLine()
+        let s = ''
+        let wn = ''
+        let t = tabpagenr()
+        let i = 1
+        while i <= tabpagenr('$')
+            let buflist = tabpagebuflist(i)
+            let winnr = tabpagewinnr(i)
+            let s .= '%' . i . 'T'
+            let s .= (i == t ? '%1*' : '%2*')
+            "let s .= ' '
+            let wn = tabpagewinnr(i,'$')
+
+            let s .= '%#TabNum#'
+            "let s .= '%#TabLineSel#'
+            let s .= '|'
+            let s .= i
+            let s .= '|'
+            "let s .= '%*'
+            let s .= (i == t ? '%#TabLineSel#' : '%#TabLine#')
+            let bufnr = buflist[winnr - 1]
+            let file = bufname(bufnr)
+            let buftype = getbufvar(bufnr, 'buftype')
+            if buftype == 'nofile'
+                if file =~ '\/.'
+                    let file = substitute(file, '.*\/\ze.', '', '')
+                endif
+            else
+                let file = fnamemodify(file, ':p:t')
+            endif
+            if file == ''
+                let file = '[No Name]'
+            endif
+            let s .= ' ' . file . ' '
+            let i = i + 1
+        endwhile
+        let s .= '%T%#TabLineFill#%='
+        "let s .= (tabpagenr('$') > 1 ? '%999XX' : 'X')
+        return s
+    endfunction
+    set stal=2
+    set tabline=%!MyTabLine()
+    set showtabline=1
+    highlight link TabNum Special
+endif
 
 "If the Pmenu is messed up try setting colors manually:
 "highlight PMenuSel cterm=bold ctermbg=Green ctermfg=None
