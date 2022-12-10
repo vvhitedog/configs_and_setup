@@ -188,6 +188,7 @@ if !&diff && !&pvw
     nn <silent> <M-e> :call CocLocations('ccls','$ccls/inheritance',{'hierarchy':v:true})<cr>
 
     nn <silent> <M-l> :execute '! xdg-open $(echo https://github.com/omnisci/omniscidb-internal/blob/$(git rev-parse --abbrev-ref HEAD)/' . @% . '\#L' . line(".") . ')'<cr>
+    nn <silent> <M-L> :execute '! xdg-open $(echo https://github.com/omnisci/omniscidb-internal/blob/master/' . @% . '\#L' . line(".") . ')'<cr>
 
     nn <silent> <M-c> :sil execute '! echo $(readlink -f ' . @% . '):' . line(".") . ' \| tr -d "\n" \| xsel -ib'<cr>
 
@@ -251,11 +252,29 @@ if !&diff && !&pvw
          execute 'r!git show ' . trim(a:base) . ':' . trim(bufname(winbufnr(winnr('#'))))
          set ft=cpp
          normal ggdd
-         w! /tmp/nvim-git-show.tmp
+         execute 'w! ' . tempname()
          wincmd H
          execute 'windo diffthis'
        endif
     endfunction
+
+    function GenTags()
+       execute '!ctags -R --exclude="*build*" --exclude="*Test/FsiDataFiles*" --exclude=".ccls-cache" --exclude="docker" --exclude="FsiDataFiles" .'
+    endfunction
+
+    command! -nargs=0 GenTags call GenTags()
+
+    function RipgrepDefault(arg) 
+      execute 'Rg -i -g "!tags" -g "!compile_commands.json" -g "!build*" "'  . a:arg . '"'
+    endfunction
+
+    command! -nargs=1 R call RipgrepDefault(<f-args>)
+
+    function RipgrepLocalDefault(arg) 
+      execute 'Rg -i -g "!tags" -g "!compile_commands.json" -g "!build*" "' . a:arg . '" %'
+    endfunction
+
+    command! -nargs=1 Rh call RipgrepLocalDefault(<f-args>)
 
     function GitDiffWin2(base1,base2)
        if filereadable(@%)
@@ -415,3 +434,4 @@ let g:pydocstring_formatter = 'numpy'
 
 " colorcolumn
 set colorcolumn=80
+:let g:python_recommended_style = 0
