@@ -94,13 +94,16 @@ call plug#begin(stdpath('data') . '/plugged')
 if !&diff
     Plug 'heavenshell/vim-pydocstring'
     Plug 'vim-scripts/DoxygenToolkit.vim'
-    Plug 'neoclide/coc.nvim', { 'branch': 'release', 'tag': 'v0.0.76' }
-    "Plug 'neoclide/coc.nvim', { 'branch': 'release' }
+    Plug 'neoclide/coc.nvim', { 'branch': 'release' }
+    "Plug 'neoclide/coc.nvim', { 'tag' : 'v0.0.76' }
+    "Plug 'neoclide/coc.nvim'
     Plug 'vim-scripts/a.vim'
     Plug 'vvhitedog/tagbar'
     Plug 'dhruvasagar/vim-table-mode'
     Plug 'davidhalter/jedi-vim'
     Plug 'jremmen/vim-ripgrep'
+    Plug 'github/copilot.vim', { 'branch' : 'release' }
+    Plug 'sjl/vitality.vim'
 endif
 
 " These are colorschemes so okay to have in diff
@@ -128,19 +131,21 @@ set shortmess+=c
 " diagnostics appear/become resolved.
 set signcolumn=yes
 
-" Use tab for trigger completion with characters ahead and navigate.
-" NOTE: Use command ':verbose imap <tab>' to make sure tab is not mapped by
-" other plugin before putting this into your config.
-inoremap <silent><expr> <TAB>
-      \ pumvisible() ? "\<C-n>" :
-      \ <SID>check_back_space() ? "\<TAB>" :
-      \ coc#refresh()
-inoremap <expr><S-TAB> pumvisible() ? "\<C-p>" : "\<C-h>"
+inoremap <expr> <cr> coc#pum#visible() ? coc#pum#confirm() : "\<CR>"
 
-function! s:check_back_space() abort
+" use <tab> to trigger completion and navigate to the next complete item
+function! CheckBackspace() abort
   let col = col('.') - 1
   return !col || getline('.')[col - 1]  =~# '\s'
 endfunction
+
+inoremap <silent><expr> <Tab>
+      \ coc#pum#visible() ? coc#pum#next(1) :
+      \ CheckBackspace() ? "\<Tab>" :
+      \ coc#refresh()
+
+inoremap <expr> <Tab> coc#pum#visible() ? coc#pum#next(1) : "\<Tab>"
+inoremap <expr> <S-Tab> coc#pum#visible() ? coc#pum#prev(1) : "\<S-Tab>"
 
 " python related
 let g:jedi#goto_command = "<C-j>"
@@ -153,7 +158,7 @@ if !&diff && !&pvw
     nnoremap ]m }]m{jf(b
 
     " Jump to first tag
-    set nocscopetag
+    "set nocscopetag
 
     " F5: Find usages/occurrences using rg (r-grep)
     inoremap <expr> <F5>  "<Esc> :sil grep ".expand('<cword>')." .<CR>:botr cw<CR>"
@@ -187,8 +192,11 @@ if !&diff && !&pvw
 
     nn <silent> <M-e> :call CocLocations('ccls','$ccls/inheritance',{'hierarchy':v:true})<cr>
 
-    nn <silent> <M-l> :execute '! xdg-open $(echo https://github.com/omnisci/omniscidb-internal/blob/$(git rev-parse --abbrev-ref HEAD)/' . @% . '\#L' . line(".") . ')'<cr>
-    nn <silent> <M-L> :execute '! xdg-open $(echo https://github.com/omnisci/omniscidb-internal/blob/master/' . @% . '\#L' . line(".") . ')'<cr>
+    " nn <silent> <M-l> :execute '! xdg-open "$(echo https://github.com/omnisci/omniscidb-internal/blob/$(git rev-parse --abbrev-ref HEAD)/' . @% . '\#L' . line(".") . ')"'<cr>
+    " nn <silent> <M-L> :execute '! xdg-open "$(echo https://github.com/omnisci/omniscidb-internal/blob/master/' . @% . '\#L' . line(".") . ')"'<cr>
+
+    nn <silent> <M-l> :call jobstart('xdg-open "$(echo https://github.com/omnisci/omniscidb-internal/blob/$(git rev-parse --abbrev-ref HEAD)/' . @% . '\#L' . line(".") . ')"')<cr>
+    nn <silent> <M-L> :call jobstart('xdg-open "$(echo https://github.com/omnisci/omniscidb-internal/blob/master/' . @% . '\#L' . line(".") . ')"')<cr>
 
     nn <silent> <M-c> :sil execute '! echo $(readlink -f ' . @% . '):' . line(".") . ' \| tr -d "\n" \| xsel -ib'<cr>
 
@@ -200,22 +208,16 @@ if !&diff && !&pvw
 
     " Use <cr> to confirm completion, `<C-g>u` means break undo chain at current
     " position. Coc only does snippet and additional edit on confirm.
-    if has('patch8.1.1068')
-      " Use `complete_info` if your (Neo)Vim version supports it.
-      inoremap <expr> <cr> complete_info()["selected"] != "-1" ? "\<C-y>" : "\<C-g>u\<CR>"
-    else
-      imap <expr> <cr> pumvisible() ? "\<C-y>" : "\<C-g>u\<CR>"
-    endif
+    "if has('patch8.1.1068')
+    "  " Use `complete_info` if your (Neo)Vim version supports it.
+    "  inoremap <expr> <cr> complete_info()["selected"] != "-1" ? "\<C-y>" : "\<C-g>u\<CR>"
+    "else
+    "  imap <expr> <cr> pumvisible() ? "\<C-y>" : "\<C-g>u\<CR>"
+    "endif
 
     function! HelpWithFocus()
       call CocAction('doHover')
-      call coc#util#float_jump()
     endfunction
-    nn <silent> K :call HelpWithFocus()<cr>
-
-    nnoremap <expr><down> coc#util#has_float() ? coc#util#float_scroll(1) : "\<down>"
-    nnoremap <expr><up> coc#util#has_float() ? coc#util#float_scroll(0) : "\<up>"
-
     nn <silent> K :call HelpWithFocus()<cr>
 
     inoremap <silent><expr> <c-space> coc#refresh()
@@ -263,6 +265,21 @@ if !&diff && !&pvw
     endfunction
 
     command! -nargs=0 GenTags call GenTags()
+
+    function Terminal(name)
+       execute 'terminal'
+       execute 'file ' . trim(a:name)
+    endfunction
+
+    command! -nargs=1 Term call Terminal(<f-args>)
+
+    function TabTerminal(name)
+       execute 'tabe'
+       execute 'terminal'
+       execute 'file ' . trim(a:name)
+    endfunction
+
+    command! -nargs=1 TTerm call TabTerminal(<f-args>)
 
     function RipgrepDefault(arg) 
       execute 'Rg -i -g "!tags" -g "!compile_commands.json" -g "!build*" "'  . a:arg . '"'
@@ -336,6 +353,48 @@ if !&diff && !&pvw
     nmap <M-5> 5gt
     nmap <M-6> 6gt
     nmap <M-7> 7gt
+    nmap <M-8> 8gt
+    nmap <M-9> 9gt
+
+    imap <M-1> <ESC>1gt
+    imap <M-2> <ESC>2gt
+    imap <M-3> <ESC>3gt
+    imap <M-4> <ESC>4gt
+    imap <M-5> <ESC>5gt
+    imap <M-6> <ESC>6gt
+    imap <M-7> <ESC>7gt
+    imap <M-8> <ESC>8gt
+    imap <M-9> <ESC>9gt
+
+    vmap <M-1> <ESC>1gt
+    vmap <M-2> <ESC>2gt
+    vmap <M-3> <ESC>3gt
+    vmap <M-4> <ESC>4gt
+    vmap <M-5> <ESC>5gt
+    vmap <M-6> <ESC>6gt
+    vmap <M-7> <ESC>7gt
+    vmap <M-8> <ESC>8gt
+    vmap <M-9> <ESC>9gt
+
+    tmap <M-1> <C-\><C-n>1gt
+    tmap <M-2> <C-\><C-n>2gt
+    tmap <M-3> <C-\><C-n>3gt
+    tmap <M-4> <C-\><C-n>4gt
+    tmap <M-5> <C-\><C-n>5gt
+    tmap <M-6> <C-\><C-n>6gt
+    tmap <M-7> <C-\><C-n>7gt
+    tmap <M-8> <C-\><C-n>8gt
+    tmap <M-9> <C-\><C-n>9gt
+
+    nmap <C-s> g<TAB>
+    imap <C-s> <ESC>g<TAB>
+    vmap <C-s> <ESC>g<TAB>
+    tmap <C-s> <C-\><C-n>g<TAB>
+
+    nmap <C-a> <ESC>
+    imap <C-a> <ESC>
+    vmap <C-a> <ESC>
+    tmap <C-a> <C-\><C-n>
 
 endif
 
@@ -371,6 +430,8 @@ hi TabLineSel guifg=#282c34 guibg=#abb2bf
 hi TabLineFill guifg=#14161a guibg=#676b73
 hi Title guibg=#282c34 guifg=#abb2bf
 hi TabLineNC guibg=#dae2f2 guifg=#74a0f7
+
+hi Normal guibg=#1D282E
 
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 "" FIX TABLLINE TO SHOW NUMBERS:
@@ -435,3 +496,41 @@ let g:pydocstring_formatter = 'numpy'
 " colorcolumn
 set colorcolumn=80
 :let g:python_recommended_style = 0
+
+" wtf?
+if has('nvim-0.4.3') || has('patch-8.2.0750')
+          nnoremap <nowait><expr> <C-y> coc#float#has_scroll() ? coc#float#scroll(1) : "\<C-f>"
+          nnoremap <nowait><expr> <C-e> coc#float#has_scroll() ? coc#float#scroll(0) : "\<C-b>"
+          inoremap <nowait><expr> <C-y> coc#float#has_scroll() ? "\<c-r>=coc#float#scroll(1)\<cr>" : "\<Right>"
+          inoremap <nowait><expr> <C-e> coc#float#has_scroll() ? "\<c-r>=coc#float#scroll(0)\<cr>" : "\<Left>"
+endif
+
+
+"From help :
+"To map <Esc> to exit terminal-mode: >vim
+":tnoremap <Esc> <C-\><C-n>
+" Currently disabled due to prefering to use ALT+N to switch to normal mode,
+" this also allows the use of VIM or NEOVIM within the terminals
+
+set cursorline
+
+autocmd FocusLost * hi Normal guibg=#0a2333
+autocmd FocusGained * hi Normal guibg=#1D282E
+
+function! ConfirmQuit(all)
+    let l:confirmed = confirm("Terminal(s) may be open, do you really want to quit?", "&Yes\n&No", 2)
+    if l:confirmed == 1
+      if (a:all)
+        quitall
+      else
+        quit
+      endif
+    endif
+endfu
+
+au termopen * cnoremap <silent> q<cr> call ConfirmQuit(0)<cr>
+au termenter * cnoremap <silent> q<cr> call ConfirmQuit(0)<cr>
+au termleave * cnoremap <silent> q<cr> call ConfirmQuit(0)<cr>
+au termopen * cnoremap <silent> qa<cr> call ConfirmQuit(1)<cr>
+au termenter * cnoremap <silent> qa<cr> call ConfirmQuit(1)<cr>
+au termleave * cnoremap <silent> qa<cr> call ConfirmQuit(1)<cr>
