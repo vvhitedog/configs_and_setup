@@ -28,6 +28,9 @@ set expandtab
 set shiftwidth=2
 set smarttab
 
+"Use 4 spaces in python
+autocmd FileType python setlocal shiftwidth=4 softtabstop=4 expandtab
+
 set noswapfile
 
 "Colouring
@@ -244,7 +247,7 @@ if !&diff && !&pvw
          execute 'r!git diff ' a:base ' #'
          set ft=diff
          normal ggdd
-         w! /tmp/nvim-git-diff.tmp
+         execute 'w! ' . tempname()
        endif
     endfunction
 
@@ -316,6 +319,8 @@ if !&diff && !&pvw
        endif
     endfunction
 
+    nmap <leader>qf <Plug>(coc-fix-current)
+
     nmap <M-g> :call GitDiff("")<cr>
     nmap <M-G> :call GitDiff("origin/HEAD")<cr>
 
@@ -331,7 +336,7 @@ if !&diff && !&pvw
          r!git blame #
          set ft=cpp
          normal ggdd
-         w! /tmp/nvim-git-blame.tmp
+         execute 'w! ' . tempname()
          execute 'normal ' . lineno . 'G'
        endif
     endfunction
@@ -396,6 +401,16 @@ if !&diff && !&pvw
     vmap <C-a> <ESC>
     tmap <C-a> <C-\><C-n>
 
+    nmap <A-j> :CocList buffers<cr>
+    imap <A-j> <ESC>:CocList buffers<cr>
+    vmap <A-j> <ESC>:CocList buffers<cr>
+    tmap <A-j> <C-\><C-n>:CocList buffers<cr>
+
+    nmap <C-x><C-x> :CocList windows<cr>
+    imap <C-x><C-x> <ESC>:CocList windows<cr>
+    vmap <C-x><C-x> <ESC>:CocList windows<cr>
+    tmap <C-x><C-x> <C-\><C-n>:CocList windows<cr>
+
 endif
 
 "filetype plugin indent on
@@ -404,15 +419,8 @@ endif
 " cursor, so undefine the mapping there.
 autocmd BufReadPost quickfix nnoremap <buffer> <CR> <CR>
 
-set previewheight=60
-au BufEnter ?* call PreviewHeightWorkAround()
-func PreviewHeightWorkAround()
-    if &previewwindow
-        exec 'setlocal winheight='.&previewheight
-    else
-        exec 'setlocal winheight=1'
-    endif
-endfunc
+set previewheight=25
+nmap <M-]> <C-w>}<C-w><C-w>
 
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 "" COLORS AND DISPLAY:
@@ -420,7 +428,7 @@ endfunc
 set termguicolors
 colorscheme onedark
 
-set statusline=%t[%{strlen(&fenc)?&fenc:'none'},%{&ff}]%h%m%r%y%=%c,%l/%L\ %P
+set statusline=%f[%{strlen(&fenc)?&fenc:'none'},%{&ff}]%h%m%r%y%=%c,%l/%L\ %P
 
 hi TagbarVisibilityProtected guifg=orange 
 hi StatusLine guifg=#282c34 guibg=#abb2bf
@@ -514,7 +522,8 @@ endif
 
 set cursorline
 
-autocmd FocusLost * hi Normal guibg=#0a2333
+"autocmd FocusLost * hi Normal guibg=#0a2333
+autocmd FocusLost * hi Normal guibg=#0e191f
 autocmd FocusGained * hi Normal guibg=#1D282E
 
 function! ConfirmQuit(all)
