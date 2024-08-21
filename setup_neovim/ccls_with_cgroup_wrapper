@@ -1,0 +1,10 @@
+#!/bin/bash
+# This wrapper is intended to be used to control the memory use of ccls which can be enormous.
+# This does not work out-of-the-box on Ubuntu 20.04, but does in 22.04+ (tested 22.04 only so far.)
+# Can be made to work in 20.04 with much effort, but not worth it.
+  
+bin=${HOME}/software/ccls/Release/ccls #TODO: enusure correct path for deployment!
+
+systemd-run --scope -p MemoryMax=20000M --user  $bin "$@"
+
+
