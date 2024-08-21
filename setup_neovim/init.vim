@@ -535,7 +535,7 @@ endif
 
 set cursorline
 
-# helps visualize active windows
+" helps visualize active windows
 autocmd FocusLost * hi Normal guibg=#0e191f
 autocmd FocusGained * hi Normal guibg=#1D282E
 
