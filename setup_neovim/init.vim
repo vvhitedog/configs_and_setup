@@ -43,19 +43,6 @@ set background=dark
 "Ignore case on searches
 set ic
 
-"Move the vim local dir around intuitively
-function LcdIfPossible()
-   if filereadable(@%)
-      lcd %:h
-   endif
-endfunction
-"if !&diff
-"    augroup Lcd
-"        autocmd!
-"        autocmd BufWinEnter * call LcdIfPossible()
-"    augroup END
-"endif
-
 "Force standard backspace behaviour
 set backspace=2
 
@@ -98,8 +85,6 @@ if !&diff
     Plug 'heavenshell/vim-pydocstring'
     Plug 'vim-scripts/DoxygenToolkit.vim'
     Plug 'neoclide/coc.nvim', { 'branch': 'release' }
-    "Plug 'neoclide/coc.nvim', { 'tag' : 'v0.0.76' }
-    "Plug 'neoclide/coc.nvim'
     Plug 'vim-scripts/a.vim'
     Plug 'vvhitedog/tagbar'
     Plug 'dhruvasagar/vim-table-mode'
@@ -114,7 +99,6 @@ Plug 'morhetz/gruvbox'
 Plug 'tyrannicaltoucan/vim-quantum'
 Plug 'joshdick/onedark.vim'
 Plug 'bfrg/vim-cpp-modern'
-"Plug 'rafi/awesome-vim-colorschemes'
 
 " Initialize plugin system
 call plug#end()
@@ -160,9 +144,6 @@ if !&diff && !&pvw
     nnoremap [m [m{jf(b
     nnoremap ]m }]m{jf(b
 
-    " Jump to first tag
-    "set nocscopetag
-
     " F5: Find usages/occurrences using rg (r-grep)
     inoremap <expr> <F5>  "<Esc> :sil grep ".expand('<cword>')." .<CR>:botr cw<CR>"
     nnoremap <expr> <F5> ":sil grep ".expand('<cword>')." . <CR>:botr cw<CR>"
@@ -184,7 +165,7 @@ if !&diff && !&pvw
     nmap <silent> <C-f> :CocList files<cr>
 
     " follow inheritance
-    " basese
+    " bases
     nn <silent> <M-b> :call CocLocations('ccls','$ccls/inheritance')<cr>
     " bases of up to 3 levels
     nn <silent> <M-B> :call CocLocations('ccls','$ccls/inheritance',{'levels':3})<cr>
@@ -195,28 +176,18 @@ if !&diff && !&pvw
 
     nn <silent> <M-e> :call CocLocations('ccls','$ccls/inheritance',{'hierarchy':v:true})<cr>
 
-    " nn <silent> <M-l> :execute '! xdg-open "$(echo https://github.com/omnisci/omniscidb-internal/blob/$(git rev-parse --abbrev-ref HEAD)/' . @% . '\#L' . line(".") . ')"'<cr>
-    " nn <silent> <M-L> :execute '! xdg-open "$(echo https://github.com/omnisci/omniscidb-internal/blob/master/' . @% . '\#L' . line(".") . ')"'<cr>
 
+    " specific loads
     nn <silent> <M-l> :call jobstart('xdg-open "$(echo https://github.com/omnisci/omniscidb-internal/blob/$(git rev-parse --abbrev-ref HEAD)/' . @% . '\#L' . line(".") . ')"')<cr>
     nn <silent> <M-L> :call jobstart('xdg-open "$(echo https://github.com/omnisci/omniscidb-internal/blob/master/' . @% . '\#L' . line(".") . ')"')<cr>
 
     nn <silent> <M-c> :sil execute '! echo $(readlink -f ' . @% . '):' . line(".") . ' \| tr -d "\n" \| xsel -ib'<cr>
 
-    " fine-graned references, callee vs caller
+    " fine-grained references, callee vs caller
     " caller
     nn <silent> <M-x>c :call CocLocations('ccls','$ccls/call')<cr>
     " callee
     nn <silent> <M-x>C :call CocLocations('ccls','$ccls/call',{'callee':v:true})<cr>
-
-    " Use <cr> to confirm completion, `<C-g>u` means break undo chain at current
-    " position. Coc only does snippet and additional edit on confirm.
-    "if has('patch8.1.1068')
-    "  " Use `complete_info` if your (Neo)Vim version supports it.
-    "  inoremap <expr> <cr> complete_info()["selected"] != "-1" ? "\<C-y>" : "\<C-g>u\<CR>"
-    "else
-    "  imap <expr> <cr> pumvisible() ? "\<C-y>" : "\<C-g>u\<CR>"
-    "endif
 
     function! HelpWithFocus()
       call CocAction('doHover')
@@ -241,27 +212,67 @@ if !&diff && !&pvw
     
     let g:tagbar_ctags_bin = '/home/mgara/.local/bin/ctags'
 
+    function! Scratch()
+        wincmd n
+        noswapfile hide enew
+        setlocal buftype=nofile
+        setlocal bufhidden=hide
+        "setlocal nobuflisted
+        "lcd ~
+        file [scratch]
+    endfunction
+
+    function! SetName(bufname)
+      let bnr = bufnr(a:bufname)
+      if bnr > 0
+        execute 'bd ' . bnr
+      endif
+      execute 'file ' . a:bufname
+    endfunction
+
+    function! ScratchNewTab()
+        call Scratch()
+        wincmd T
+    endfunction
+
     function GitDiff(base)
        if filereadable(@%)
-         wincmd n
-         execute 'r!git diff ' a:base ' #'
+         call Scratch()
+         execute 'r!git diff ' trim(a:base) ' #'
          set ft=diff
          normal ggdd
-         execute 'w! ' . tempname()
+         call SetName('file [diff] ' trim(a:base) ' #')
        endif
     endfunction
 
     function GitDiffWin(base)
        if filereadable(@%)
-         wincmd n
+         let thisft = &ft
+         call Scratch()
          execute 'r!git show ' . trim(a:base) . ':' . trim(bufname(winbufnr(winnr('#'))))
-         set ft=cpp
+         let &ft=thisft
          normal ggdd
-         execute 'w! ' . tempname()
+         call SetName('[diffwin] ' . trim(a:base) . ':' . trim(bufname(winbufnr(winnr('#')))))
          wincmd H
          execute 'windo diffthis'
        endif
     endfunction
+
+    function OpenFileAndGitDiffWin(base)
+      wincmd gf
+      call GitDiffWin(a:base)
+    endfunction
+
+
+    function GitDiffFiles(base)
+       call ScratchNewTab()
+       execute 'r!git diff --name-status ' . trim(a:base)
+       set ft=markdown
+       normal ggdd
+       call SetName('[filelist] ' . trim(a:base))
+       wincmd H
+    endfunction
+
 
     function GenTags()
        execute '!ctags -R --exclude="*build*" --exclude="*Test/FsiDataFiles*" --exclude=".ccls-cache" --exclude="docker" --exclude="FsiDataFiles" .'
@@ -298,20 +309,22 @@ if !&diff && !&pvw
 
     function GitDiffWin2(base1,base2)
        if filereadable(@%)
+         let thisft = &ft
 
-         wincmd n
+         call Scratch()
          execute 'r!git show ' . trim(a:base1) . ':' . trim(bufname(winbufnr(winnr('#'))))
-         set ft=cpp
+         let &ft=thisft
          normal ggdd
-         w! /tmp/nvim-git-show-1.tmp
+         execute 'bd [diffwin2] ' . trim(a:base1) . ':' . trim(bufname(winbufnr(winnr('#'))))
+         call SetName('[diffwin2] ' . trim(a:base1) . ':' . trim(bufname(winbufnr(winnr('#')))))
          wincmd H
          wincmd w
 
-         wincmd n
+         call Scratch()
          execute 'r!git show ' . trim(a:base2) . ':' . trim(bufname(winbufnr(winnr('#'))))
-         set ft=cpp
+         let &ft=thisft
          normal ggdd
-         w! /tmp/nvim-git-show-2.tmp
+         call SetName('[diffwin2] ' . trim(a:base2) . ':' . trim(bufname(winbufnr(winnr('#')))))
          wincmd H
          wincmd w
 
@@ -327,16 +340,23 @@ if !&diff && !&pvw
     nmap <M-f> :call GitDiffWin("")<cr>
     nmap <M-F> :call GitDiffWin("origin/HEAD")<cr>
 
+    nmap <M-s> :call OpenFileAndGitDiffWin("")<cr>
+    nmap <M-S> :call OpenFileAndGitDiffWin("origin/HEAD")<cr>
+
+    nmap <M-z> :call GitDiffFiles("")<cr>
+    nmap <M-Z> :call GitDiffFiles("origin/HEAD")<cr>
+
     nmap <C-q> :bd<cr>:bd<cr>
 
     function GitBlame()
        if filereadable(@%)
+         let thisft = &ft
          let lineno = line('.')
-         wincmd n
+         call Scratch()
          r!git blame #
-         set ft=cpp
+         let &ft=thisft
          normal ggdd
-         execute 'w! ' . tempname()
+         call SetName('[blame] ' . trim(bufname(winbufnr(winnr('#')))))
          execute 'normal ' . lineno . 'G'
        endif
     endfunction
@@ -476,7 +496,7 @@ if exists("+showtabline")
                     let file = substitute(file, '.*\/\ze.', '', '')
                 endif
             else
-                let file = fnamemodify(file, ':p:t')
+                "let file = fnamemodify(file, ':p:t')
             endif
             if file == ''
                 let file = '[No Name]'
@@ -505,7 +525,7 @@ let g:pydocstring_formatter = 'numpy'
 set colorcolumn=80
 :let g:python_recommended_style = 0
 
-" wtf?
+" wtf? is this needed?
 if has('nvim-0.4.3') || has('patch-8.2.0750')
           nnoremap <nowait><expr> <C-y> coc#float#has_scroll() ? coc#float#scroll(1) : "\<C-f>"
           nnoremap <nowait><expr> <C-e> coc#float#has_scroll() ? coc#float#scroll(0) : "\<C-b>"
@@ -513,16 +533,9 @@ if has('nvim-0.4.3') || has('patch-8.2.0750')
           inoremap <nowait><expr> <C-e> coc#float#has_scroll() ? "\<c-r>=coc#float#scroll(0)\<cr>" : "\<Left>"
 endif
 
-
-"From help :
-"To map <Esc> to exit terminal-mode: >vim
-":tnoremap <Esc> <C-\><C-n>
-" Currently disabled due to prefering to use ALT+N to switch to normal mode,
-" this also allows the use of VIM or NEOVIM within the terminals
-
 set cursorline
 
-"autocmd FocusLost * hi Normal guibg=#0a2333
+# helps visualize active windows
 autocmd FocusLost * hi Normal guibg=#0e191f
 autocmd FocusGained * hi Normal guibg=#1D282E
 
