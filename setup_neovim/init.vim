@@ -1,9 +1,28 @@
 "Ensure clipboard works with vimx
 set clipboard=unnamed
 
-"Search for tags files all the way back to /
-"Tags are a way of indexing code - useful for multifile projects
-set tags=tags;/
+"Only use base dir tags
+set tags=./tags;
+function! FindNearestTagsFile()
+  let l:dir = expand('%:p:h')
+  let l:pwd = getcwd()
+  while 1
+    if filereadable(l:dir . '/tags')
+      return l:dir . '/tags'
+    endif
+    if l:dir ==# l:pwd || l:dir ==# '/'
+      break
+    endif
+    let l:dir = fnamemodify(l:dir, ':h')
+  endwhile
+  " fallback: use tags in current working dir if found
+  if filereadable(l:pwd . '/tags')
+    return l:pwd . '/tags'
+  endif
+  return ''
+endfunction
+
+autocmd BufEnter * let &tags = FindNearestTagsFile()
 
 "Turn on filetype plugins and indentation
 filetype indent plugin on
@@ -82,16 +101,12 @@ filetype off                  " required
 call plug#begin(stdpath('data') . '/plugged')
 
 if !&diff
-    Plug 'heavenshell/vim-pydocstring'
-    Plug 'vim-scripts/DoxygenToolkit.vim'
     Plug 'neoclide/coc.nvim', { 'branch': 'release' }
     Plug 'vim-scripts/a.vim'
     Plug 'vvhitedog/tagbar'
-    Plug 'dhruvasagar/vim-table-mode'
-    Plug 'davidhalter/jedi-vim'
     Plug 'jremmen/vim-ripgrep'
-    Plug 'github/copilot.vim', { 'branch' : 'release' }
     Plug 'sjl/vitality.vim'
+    Plug 'Yggdroot/LeaderF', { 'do': ':LeaderfInstallCExtension' }
 endif
 
 " These are colorschemes so okay to have in diff
@@ -134,9 +149,6 @@ inoremap <silent><expr> <Tab>
 inoremap <expr> <Tab> coc#pum#visible() ? coc#pum#next(1) : "\<Tab>"
 inoremap <expr> <S-Tab> coc#pum#visible() ? coc#pum#prev(1) : "\<S-Tab>"
 
-" python related
-let g:jedi#goto_command = "<C-j>"
-
 " Check that we are not in diff or preview window modes
 if !&diff && !&pvw 
 
@@ -144,13 +156,6 @@ if !&diff && !&pvw
     nnoremap [m [m{jf(b
     nnoremap ]m }]m{jf(b
 
-    " F5: Find usages/occurrences using rg (r-grep)
-    inoremap <expr> <F5>  "<Esc> :sil grep ".expand('<cword>')." .<CR>:botr cw<CR>"
-    nnoremap <expr> <F5> ":sil grep ".expand('<cword>')." . <CR>:botr cw<CR>"
-
-    " F4: Find usages/occurrences in current file using vim-grep
-    inoremap <expr> <F4>  "<Esc> :lv /".expand('<cword>')."/j % \| :lwindow<CR>"
-    nnoremap <expr> <F4> ":lv /".expand('<cword>')."/j % \| :lwindow<CR>"
     " Format using clang
     inoremap <F7> <Esc> :%!clang-format <CR>
     nnoremap <F7>  :%!clang-format <CR>
@@ -158,36 +163,62 @@ if !&diff && !&pvw
     nmap <silent> <C-l> :TagbarClose<cr><Plug>(coc-declaration)
     nmap <silent> <C-j> :TagbarClose<cr><Plug>(coc-definition)
     nmap <silent> <C-k> :TagbarClose<cr><Plug>(coc-references)
+    nnoremap <silent> <C-M-j> :TagbarClose<cr>:call CocAction('jumpImplementation')<CR>
 
     nnoremap <silent> <M-m> :CocList outline<cr>
+
+
+    nn <silent> <M-l> :Leaderf line --fuzzy<cr>
+    nn <silent> <M-r> :Leaderf rg --fuzzy<cr>
+
+
+    nmap <silent> <M-n> :LfTagIncremental<cr>
     nmap <silent> <C-n> :CocList symbols<cr>
     nmap <silent> <C-h> :CocList --interactive symbols -kind class<cr>
-    nmap <silent> <C-f> :CocList files<cr>
+    nmap <silent> <C-f> :Leaderf file --no-ignore --fuzzy<cr>
+    nmap <silent> <C-M-f> :Leaderf! file --no-ignore --fuzzy<cr>
+    nmap <silent> <C-g> :Leaderf mru --fuzzy<cr>
 
-    " follow inheritance
-    " bases
-    nn <silent> <M-b> :call CocLocations('ccls','$ccls/inheritance')<cr>
-    " bases of up to 3 levels
-    nn <silent> <M-B> :call CocLocations('ccls','$ccls/inheritance',{'levels':3})<cr>
-    " derived
-    nn <silent> <M-d> :call CocLocations('ccls','$ccls/inheritance',{'derived':v:true})<cr>
-    " derived of up to 3 levels
-    nn <silent> <M-D> :call CocLocations('ccls','$ccls/inheritance',{'derived':v:true,'levels':3,'qualified':v:false})<cr>
+    function! OpenGithubUrl(branch)
+      " Get repo remote URL
+      let l:remote = system('git remote get-url origin')
+      let l:remote = substitute(l:remote, '\n', '', 'g')
+      let l:url = l:remote
 
-    nn <silent> <M-e> :call CocLocations('ccls','$ccls/inheritance',{'hierarchy':v:true})<cr>
+      " handle git@github.com:org/repo.git
+      let l:url = substitute(l:url, '^git@github.com:', 'https://github.com/', '')
+      " handle https://github.com/org/repo.git
+      let l:url = substitute(l:url, '\.git$', '', '')
 
+      " Repo root and relative file path
+      let l:root = substitute(system('git rev-parse --show-toplevel'), '\n', '', 'g')
+      let l:file = expand('%:p')
+      let l:file = substitute(l:file, l:root . '/', '', '')
 
-    " specific loads
-    nn <silent> <M-l> :call jobstart('xdg-open "$(echo https://github.com/omnisci/omniscidb-internal/blob/$(git rev-parse --abbrev-ref HEAD)/' . @% . '\#L' . line(".") . ')"')<cr>
-    nn <silent> <M-L> :call jobstart('xdg-open "$(echo https://github.com/omnisci/omniscidb-internal/blob/master/' . @% . '\#L' . line(".") . ')"')<cr>
+      " Line number
+      let l:line = line('.')
+
+      " Use given branch or fallback to current branch
+      if a:branch == ''
+        let l:branch = substitute(system('git rev-parse --abbrev-ref HEAD'), '\n', '', 'g')
+      else
+        let l:branch = a:branch
+      endif
+
+      " Build final URL
+      let l:ghurl = l:url . '/blob/' . l:branch . '/' . l:file . '#L' . l:line
+
+      " Open in browser
+      call jobstart(['xdg-open', l:ghurl])
+    endfunction
+
+    " Map Meta-v to current branch
+    nnoremap <silent> <M-v> :call OpenGithubUrl('')<CR>
+
+    " Map Meta-V to master branch
+    nnoremap <silent> <M-V> :call OpenGithubUrl('master')<CR>
 
     nn <silent> <M-c> :sil execute '! echo $(readlink -f ' . @% . '):' . line(".") . ' \| tr -d "\n" \| xsel -ib'<cr>
-
-    " fine-grained references, callee vs caller
-    " caller
-    nn <silent> <M-x>c :call CocLocations('ccls','$ccls/call')<cr>
-    " callee
-    nn <silent> <M-x>C :call CocLocations('ccls','$ccls/call',{'callee':v:true})<cr>
 
     function! HelpWithFocus()
       call CocAction('doHover')
@@ -199,84 +230,215 @@ if !&diff && !&pvw
     " Symbol renaming.
     nmap <leader>r <Plug>(coc-rename)
 
-    " coc rename is rather broken, use clang-rename.py instead:
-    noremap <leader>cr :pyf ~/.local/bin/clang-rename.py<cr>
-
     " help with view diffs 
     nmap <C-b> :pyf ~/.local/bin/git-diff3-view.py<cr>
 
-    " Open outline tagbar (note vista is horrible for keeping jump-lists
-    " sane.)
+    " Open outline tagbar
     nmap <M-o> :TagbarOpen j<cr>:TagbarOpen j<cr>
     nmap <M-t> :TagbarToggle<cr>
+    nmap <M-k> :TagbarClose <cr>:CocOutline<cr>
     
-    let g:tagbar_ctags_bin = '/home/mgara/.local/bin/ctags'
+    let g:tagbar_ctags_bin = expand('~/.local/bin/ctags')
 
     function! Scratch()
         wincmd n
         noswapfile hide enew
         setlocal buftype=nofile
         setlocal bufhidden=hide
-        "setlocal nobuflisted
-        "lcd ~
-        file [scratch]
     endfunction
 
     function! SetName(bufname)
       let bnr = bufnr(a:bufname)
       if bnr > 0
-        execute 'bd ' . bnr
+        execute 'silent! bd ' . bnr
       endif
       execute 'file ' . a:bufname
     endfunction
+
 
     function! ScratchNewTab()
         call Scratch()
         wincmd T
     endfunction
 
-    function GitDiff(base)
-       if filereadable(@%)
-         call Scratch()
-         execute 'r!git diff ' trim(a:base) ' #'
-         set ft=diff
-         normal ggdd
-         call SetName('file [diff] ' trim(a:base) ' #')
-       endif
+    function! ScratchThisTab()
+        call Scratch()
+        wincmd o
     endfunction
 
-    function GitDiffWin(base)
-       if filereadable(@%)
-         let thisft = &ft
-         call Scratch()
-         execute 'r!git show ' . trim(a:base) . ':' . trim(bufname(winbufnr(winnr('#'))))
-         let &ft=thisft
-         normal ggdd
-         call SetName('[diffwin] ' . trim(a:base) . ':' . trim(bufname(winbufnr(winnr('#')))))
-         wincmd H
-         execute 'windo diffthis'
-       endif
+
+    function! GitDiffWin(base)
+      if !filereadable(@%)
+        return
+      endif
+
+      let l:bufname = expand('%')
+      let l:thisft = &ft
+
+      " Get name-status diff
+      let l:ns_output = systemlist('git diff --name-status '.shellescape(a:base))
+
+      let l:oldname = ''
+      let l:is_added = v:false
+
+      " Try to find original name or detect added files
+      for line in l:ns_output
+        let l:fields = split(line, '\t')
+        if len(l:fields) == 2
+          if l:fields[0] ==# 'M' && l:fields[1] ==# l:bufname
+            let l:oldname = l:bufname
+            break
+          elseif l:fields[0] ==# 'A' && l:fields[1] ==# l:bufname
+            let l:is_added = v:true
+            break
+          endif
+        elseif len(l:fields) == 3 && l:fields[2] ==# l:bufname && l:fields[0] =~# '^R\d\+'
+          let l:oldname = l:fields[1]
+          break
+        endif
+      endfor
+
+      " If the file was newly added, just show message and exit
+      if l:is_added
+        echohl WarningMsg
+        echo '[GitDiffWin] File "' . l:bufname . '" was added; no diff available for '.a:base
+        echohl None
+        return
+      endif
+
+      " Fallback to current name if unchanged
+      if l:oldname ==# ''
+        let l:oldname = l:bufname
+      endif
+
+      " Open scratch and show old file content
+      call Scratch()
+      execute 'r!git show ' . trim(a:base) . ':' . fnameescape(l:oldname)
+      let &ft = l:thisft
+      normal! ggdd
+      call SetName('[diffwin] ' . trim(a:base) . ':' . l:oldname)
+      wincmd H
+      execute 'windo diffthis'
     endfunction
 
-    function OpenFileAndGitDiffWin(base)
+
+    function! OpenFileAndGitDiffWin(base, ...) abort
+      " Use provided base, or fall back to global
+      let l:base = a:base !=# '' ? a:base : get(g:, 'diff_base', 'origin/HEAD')
+
+      " Use provided comp_base if present, otherwise fall back to global
+      let l:comp_base = (a:0 >= 1 && !empty(a:1)) ? a:1 : get(g:, 'diff_comp_base', '')
+
       wincmd gf
-      call GitDiffWin(a:base)
+
+      if empty(l:comp_base)
+        call GitDiffWin(l:base)
+      else
+        call GitDiffWin2(l:base, l:comp_base)
+      endif
     endfunction
 
 
-    function GitDiffFiles(base)
-       call ScratchNewTab()
-       execute 'r!git diff --name-status ' . trim(a:base)
-       set ft=markdown
-       normal ggdd
-       call SetName('[filelist] ' . trim(a:base))
-       wincmd H
+    function! GitDiffFiles(base)
+      call ScratchThisTab()
+      execute 'r!git diff --name-status ' . trim(a:base)
+      set ft=git
+      normal! ggdd
+      call SetName('[filelist] ' . trim(a:base))
+      wincmd H
+      " Use global variable so other tabs/windows can access it
+      let g:diff_base = a:base
+      if exists('g:diff_comp_base')
+        unlet g:diff_comp_base
+      endif
+    endfunction
+
+    function! GitDiffFilesBetween(base, ...) abort
+      let l:base = trim(a:base)
+      let l:comp_base = (a:0 >= 1 && !empty(a:1)) ? trim(a:1) : l:base . '~1'
+
+      call ScratchThisTab()
+      let l:cmd = 'git diff --name-status ' . l:comp_base . '..' . l:base
+      execute 'r!' . l:cmd
+      set ft=git
+      normal! ggdd
+      call SetName('[filelist] ' . l:comp_base . '..' . l:base)
+      wincmd H
+
+      let g:diff_base = l:base
+      let g:diff_comp_base = l:comp_base
     endfunction
 
 
-    function GenTags()
-       execute '!ctags -R --exclude="*build*" --exclude="*Test/FsiDataFiles*" --exclude=".ccls-cache" --exclude="docker" --exclude="FsiDataFiles" .'
+    function! GenTags()
+      execute '!ctags -R --append=yes --exclude=.git --exclude="*build*" --exclude="*frontend*" --exclude="*Test/FsiDataFiles*" --exclude=".ccls-cache" --exclude="docker" --exclude="FsiDataFiles" .'
+
+      " Pretty success message with green color and checkmark
+      echohl Question
+      echon "✔ Tags updated successfully\n"
+      echohl None
     endfunction
+
+
+function! GenerateTagsIncrementally()
+python3 << EOF
+import os
+
+print("🔍 Incremental tag generation...")
+
+TAGS_FILE = 'tags'
+LIST_FILE = 'list'
+EXCLUDE_DIRS = ['.git', 'build', 'node_modules', '.ccls-cache', 'dist', '__pycache__', 'docker', 'FsiDataFiles', 'frontend', 'tag.ignore']
+
+try:
+    tags_mtime = os.stat(TAGS_FILE).st_mtime
+except FileNotFoundError:
+    tags_mtime = 0
+
+with open(LIST_FILE, 'w') as fp:
+    for dirpath, dirnames, filenames in os.walk(os.getcwd()):
+        # Exclude directories that partially match any pattern
+        dirnames[:] = [d for d in dirnames if not any(x in d for x in EXCLUDE_DIRS)]
+        for filename in filenames:
+            full_path = os.path.join(dirpath, filename)
+            try:
+                if os.stat(full_path).st_mtime > tags_mtime:
+                    fp.write(full_path + '\n')
+            except FileNotFoundError:
+                continue
+
+exit_code = os.system(
+    'ctags --recurse --append --fields=+aimS --extras=+q '
+    '--c-kinds=+p --c++-kinds=+p -L ' + LIST_FILE
+)
+
+os.remove(LIST_FILE)
+
+if exit_code == 0:
+    print("✔ Tags updated incrementally.")
+else:
+    print("✘ ctags failed.")
+
+EOF
+endfunction
+
+command! GenerateTagsIncrementally call GenerateTagsIncrementally()
+
+command! LfTagIncremental call GenerateTagsIncrementally() | Leaderf tag
+
+    let g:Lf_AutoUpdateTags = v:true
+
+
+    function! LeaderfTagWithOptionalUpdate()
+      if get(g:, 'Lf_AutoUpdateTags', v:false)
+        call GenTags()
+      endif
+      Leaderf! tag
+    endfunction
+
+    command! ToggleAutoTagUpdate let g:Lf_AutoUpdateTags = !get(g:, 'Lf_AutoUpdateTags', v:false) | echo "Auto tag update: " . (g:Lf_AutoUpdateTags ? "ON ✔" : "OFF ✘")
+
+    command! LfTag call LeaderfTagWithOptionalUpdate()
 
     command! -nargs=0 GenTags call GenTags()
 
@@ -295,6 +457,22 @@ if !&diff && !&pvw
 
     command! -nargs=1 TTerm call TabTerminal(<f-args>)
 
+    function RipgrepDefaultIgnore(...) 
+      let s:to_exec='Rg -i -g "!tags" -g "!compile_commands.json" -g "!build*"'
+      let s:regex = a:000[0]
+      for i in range(a:0)
+        if i > 0
+          let s:to_exec= s:to_exec . ' -g "' . a:000[i]  . '"'
+        endif
+      endfor
+      let s:to_exec = s:to_exec . ' "' . s:regex .  '"'
+      " useful to echo for debugging
+      echo s:to_exec 
+      execute s:to_exec
+    endfunction
+
+    command! -nargs=* Ri call RipgrepDefaultIgnore(<f-args>)
+
     function RipgrepDefault(arg) 
       execute 'Rg -i -g "!tags" -g "!compile_commands.json" -g "!build*" "'  . a:arg . '"'
     endfunction
@@ -307,35 +485,76 @@ if !&diff && !&pvw
 
     command! -nargs=1 Rh call RipgrepLocalDefault(<f-args>)
 
-    function GitDiffWin2(base1,base2)
-       if filereadable(@%)
-         let thisft = &ft
+    function! GitDiffWin2(base1, base2) abort
+      if !filereadable(@%)
+        return
+      endif
 
-         call Scratch()
-         execute 'r!git show ' . trim(a:base1) . ':' . trim(bufname(winbufnr(winnr('#'))))
-         let &ft=thisft
-         normal ggdd
-         execute 'bd [diffwin2] ' . trim(a:base1) . ':' . trim(bufname(winbufnr(winnr('#'))))
-         call SetName('[diffwin2] ' . trim(a:base1) . ':' . trim(bufname(winbufnr(winnr('#')))))
-         wincmd H
-         wincmd w
+      let l:old_more = &more
+      set nomore
 
-         call Scratch()
-         execute 'r!git show ' . trim(a:base2) . ':' . trim(bufname(winbufnr(winnr('#'))))
-         let &ft=thisft
-         normal ggdd
-         call SetName('[diffwin2] ' . trim(a:base2) . ':' . trim(bufname(winbufnr(winnr('#')))))
-         wincmd H
-         wincmd w
+      try
+        let l:bufname = expand('%')
+        let l:thisft = &ft
+        let l:oldname1 = ''
+        let l:oldname2 = ''
+        let l:is_added2 = v:false
 
-         execute 'windo diffthis'
-       endif
+        let l:ns_output = systemlist('git diff --name-status ' . shellescape(a:base1 . '..' . a:base2))
+
+        for line in l:ns_output
+          let l:fields = split(line, '\t')
+          if len(l:fields) == 2
+            if l:fields[0] ==# 'M' && l:fields[1] ==# l:bufname
+              let l:oldname1 = l:bufname
+              let l:oldname2 = l:bufname
+              break
+            elseif l:fields[0] ==# 'A' && l:fields[1] ==# l:bufname
+              let l:is_added2 = v:true
+              break
+            endif
+          elseif len(l:fields) == 3 && l:fields[2] ==# l:bufname && l:fields[0] =~# '^R\d\+'
+            let l:oldname1 = l:fields[1]
+            let l:oldname2 = l:bufname
+            break
+          endif
+        endfor
+
+        if l:is_added2
+          echohl WarningMsg
+          echo '[GitDiffWin2] File "' . l:bufname . '" was added in ' . a:base2 . '; no diff available in ' . a:base1
+          echohl None
+          return
+        endif
+
+        if l:oldname1 ==# ''
+          let l:oldname1 = l:bufname
+          let l:oldname2 = l:bufname
+        endif
+
+        call Scratch()
+        silent execute 'r!git show ' . shellescape(a:base1 . ':' . l:oldname1)
+        let &ft = l:thisft
+        normal! ggdd
+        call SetName('[diffwin2] ' . a:base1 . ':' . l:oldname1)
+        wincmd H
+        wincmd w
+
+        call Scratch()
+        silent execute 'r!git show ' . shellescape(a:base2 . ':' . l:oldname2)
+        let &ft = l:thisft
+        normal! ggdd
+        call SetName('[diffwin2] ' . a:base2 . ':' . l:oldname2)
+        wincmd H
+        wincmd w
+
+        execute 'windo diffthis'
+      finally
+        let &more = l:old_more
+      endtry
     endfunction
 
     nmap <leader>qf <Plug>(coc-fix-current)
-
-    nmap <M-g> :call GitDiff("")<cr>
-    nmap <M-G> :call GitDiff("origin/HEAD")<cr>
 
     nmap <M-f> :call GitDiffWin("")<cr>
     nmap <M-F> :call GitDiffWin("origin/HEAD")<cr>
@@ -343,10 +562,10 @@ if !&diff && !&pvw
     nmap <M-s> :call OpenFileAndGitDiffWin("")<cr>
     nmap <M-S> :call OpenFileAndGitDiffWin("origin/HEAD")<cr>
 
-    nmap <M-z> :call GitDiffFiles("")<cr>
+    nmap <M-z> :call GitDiffFiles("HEAD")<cr>
     nmap <M-Z> :call GitDiffFiles("origin/HEAD")<cr>
 
-    nmap <C-q> :bd<cr>:bd<cr>
+    nmap <C-q> :tabclose<cr>
 
     function GitBlame()
        if filereadable(@%)
@@ -362,12 +581,6 @@ if !&diff && !&pvw
     endfunction
 
     nmap <M-h> :call GitBlame()<cr>
-
-    function FifoMake()
-      call system('echo make > /tmp/fifo')
-    endfunction
-
-    nmap <M-k> :call FifoMake()<cr>
 
     let &gp="rg -n $* /dev/null"
 
@@ -421,15 +634,15 @@ if !&diff && !&pvw
     vmap <C-a> <ESC>
     tmap <C-a> <C-\><C-n>
 
-    nmap <A-j> :CocList buffers<cr>
-    imap <A-j> <ESC>:CocList buffers<cr>
-    vmap <A-j> <ESC>:CocList buffers<cr>
-    tmap <A-j> <C-\><C-n>:CocList buffers<cr>
+    nmap <A-j> :Leaderf buffer<cr>
+    imap <A-j> <ESC>:Leaderf buffer<cr>
+    vmap <A-j> <ESC>:Leaderf buffer<cr>
+    tmap <A-j> <C-\><C-n>:Leaderf buffer<cr>
 
-    nmap <C-x><C-x> :CocList windows<cr>
-    imap <C-x><C-x> <ESC>:CocList windows<cr>
-    vmap <C-x><C-x> <ESC>:CocList windows<cr>
-    tmap <C-x><C-x> <C-\><C-n>:CocList windows<cr>
+    nmap <C-x><C-x> :Leaderf window<cr>
+    imap <C-x><C-x> <ESC>:Leaderf window<cr>
+    vmap <C-x><C-x> <ESC>:Leaderf window<cr>
+    tmap <C-x><C-x> <C-\><C-n>:Leaderf window<cr>
 
 endif
 
@@ -517,21 +730,9 @@ endif
 "If the Pmenu is messed up try setting colors manually:
 "highlight PMenuSel cterm=bold ctermbg=Green ctermfg=None
 
-" setup doq
-let g:pydocstring_doq_path = '~/.local/bin/doq'
-let g:pydocstring_formatter = 'numpy'
-
 " colorcolumn
 set colorcolumn=80
 :let g:python_recommended_style = 0
-
-" wtf? is this needed?
-if has('nvim-0.4.3') || has('patch-8.2.0750')
-          nnoremap <nowait><expr> <C-y> coc#float#has_scroll() ? coc#float#scroll(1) : "\<C-f>"
-          nnoremap <nowait><expr> <C-e> coc#float#has_scroll() ? coc#float#scroll(0) : "\<C-b>"
-          inoremap <nowait><expr> <C-y> coc#float#has_scroll() ? "\<c-r>=coc#float#scroll(1)\<cr>" : "\<Right>"
-          inoremap <nowait><expr> <C-e> coc#float#has_scroll() ? "\<c-r>=coc#float#scroll(0)\<cr>" : "\<Left>"
-endif
 
 set cursorline
 
@@ -556,3 +757,6 @@ au termleave * cnoremap <silent> q<cr> call ConfirmQuit(0)<cr>
 au termopen * cnoremap <silent> qa<cr> call ConfirmQuit(1)<cr>
 au termenter * cnoremap <silent> qa<cr> call ConfirmQuit(1)<cr>
 au termleave * cnoremap <silent> qa<cr> call ConfirmQuit(1)<cr>
+
+let g:coc_global_extensions = ['coc-json', 'coc-tsserver', 'coc-clangd', 'coc-pyright']
+autocmd FileType java call CocActionAsync('runCommand', 'extension.coc-java.activate')
