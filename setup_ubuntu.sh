@@ -3,11 +3,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-INSTALL_NEOVIM=0
-INSTALL_TMUX=0
-INSTALL_ATUIN=0
-INSTALL_GHOSTTY=0
-INSTALL_BASE=0
+MODE="interview"
+SKIP_NEOVIM=0
+SKIP_TMUX=0
+SKIP_ATUIN=0
+SKIP_GHOSTTY=0
+SKIP_BASE=0
+SKIP_FONTS=0
 
 APT_UPDATED=0
 
@@ -16,12 +18,14 @@ usage() {
 Usage: setup_ubuntu.sh [options]
 
 Options:
-  --install-all          Install neovim, tmux, atuin, ghostty, and base packages
-  --install-neovim       Install or upgrade neovim
-  --install-tmux         Install or upgrade tmux
-  --install-atuin        Install or upgrade atuin
-  --install-ghostty      Install or upgrade ghostty (if available via apt)
-  --install-base         Install base packages (curl, git, ripgrep, fzf, xsel)
+  --interview            Ask about installs and overwrites (default)
+  --yolo                 Install everything and overwrite without asking
+  --skip-neovim          Skip installing or upgrading neovim
+  --skip-tmux            Skip installing or upgrading tmux
+  --skip-atuin           Skip installing or upgrading atuin
+  --skip-ghostty         Skip installing or upgrading ghostty
+  --skip-base            Skip installing base packages
+  --skip-fonts           Skip installing Sauce Code Pro fonts
   -h, --help             Show this help
 EOF
 }
@@ -31,6 +35,10 @@ prompt_yes_no() {
   local default="${2:-y}"
   local choice
   local options
+
+  if [[ "$MODE" == "yolo" ]]; then
+    return 0
+  fi
 
   if [[ "$default" == "y" ]]; then
     options="[Y/n]"
@@ -90,13 +98,15 @@ copy_file() {
     return 1
   fi
 
-  if [[ -e "$dest" ]]; then
-    if ! prompt_yes_no "Overwrite $label at $dest?" "y"; then
-      return 0
-    fi
-  else
-    if ! prompt_yes_no "Install $label to $dest?" "y"; then
-      return 0
+  if [[ "$MODE" != "yolo" ]]; then
+    if [[ -e "$dest" ]]; then
+      if ! prompt_yes_no "Overwrite $label at $dest?" "y"; then
+        return 0
+      fi
+    else
+      if ! prompt_yes_no "Install $label to $dest?" "y"; then
+        return 0
+      fi
     fi
   fi
 
@@ -114,14 +124,20 @@ copy_dir() {
     return 1
   fi
 
-  if [[ -e "$dest" ]]; then
-    if ! prompt_yes_no "Overwrite $label at $dest?" "y"; then
-      return 0
+  if [[ "$MODE" != "yolo" ]]; then
+    if [[ -e "$dest" ]]; then
+      if ! prompt_yes_no "Overwrite $label at $dest?" "y"; then
+        return 0
+      fi
+      rm -rf "$dest"
+    else
+      if ! prompt_yes_no "Install $label to $dest?" "y"; then
+        return 0
+      fi
     fi
-    rm -rf "$dest"
   else
-    if ! prompt_yes_no "Install $label to $dest?" "y"; then
-      return 0
+    if [[ -e "$dest" ]]; then
+      rm -rf "$dest"
     fi
   fi
 
@@ -200,7 +216,7 @@ ensure_bashrc_block() {
 
 install_neovim() {
   if command -v nvim >/dev/null 2>&1; then
-    if ! prompt_yes_no "Neovim already installed. Reinstall/upgrade?" "n"; then
+    if ! prompt_yes_no "Neovim already installed. Reinstall/upgrade?" "y"; then
       return 0
     fi
   else
@@ -213,7 +229,7 @@ install_neovim() {
 
 install_tmux() {
   if command -v tmux >/dev/null 2>&1; then
-    if ! prompt_yes_no "Tmux already installed. Reinstall/upgrade?" "n"; then
+    if ! prompt_yes_no "Tmux already installed. Reinstall/upgrade?" "y"; then
       return 0
     fi
   else
@@ -226,7 +242,7 @@ install_tmux() {
 
 install_atuin() {
   if command -v atuin >/dev/null 2>&1; then
-    if ! prompt_yes_no "Atuin already installed. Reinstall/upgrade?" "n"; then
+    if ! prompt_yes_no "Atuin already installed. Reinstall/upgrade?" "y"; then
       return 0
     fi
   else
@@ -251,7 +267,7 @@ install_atuin() {
 
 install_ghostty() {
   if command -v ghostty >/dev/null 2>&1; then
-    if ! prompt_yes_no "Ghostty already installed. Reinstall/upgrade?" "n"; then
+    if ! prompt_yes_no "Ghostty already installed. Reinstall/upgrade?" "y"; then
       return 0
     fi
   else
@@ -270,16 +286,16 @@ install_ghostty() {
 }
 
 install_base() {
-  if ! prompt_yes_no "Install base packages (curl git ripgrep fzf xsel)?" "y"; then
+  if ! prompt_yes_no "Install base packages (curl git ripgrep fzf xsel unzip fontconfig)?" "y"; then
     return 0
   fi
-  apt_install curl git ripgrep fzf xsel
+  apt_install curl git ripgrep fzf xsel unzip fontconfig
 }
 
 install_vim_plug() {
   local plug_path="$HOME/.local/share/nvim/site/autoload/plug.vim"
   if [[ -f "$plug_path" ]]; then
-    if ! prompt_yes_no "vim-plug already installed. Reinstall?" "n"; then
+    if ! prompt_yes_no "vim-plug already installed. Reinstall?" "y"; then
       return 0
     fi
   else
@@ -294,6 +310,29 @@ install_vim_plug() {
   fi
 
   bash "$SCRIPT_DIR/setup_neovim/install_vim_plug"
+}
+
+install_fonts() {
+  local zip_path="$SCRIPT_DIR/setup_terminator/sauce_code_fonts.zip"
+  local dest_dir="$HOME/.local/share/fonts/sauce_code_pro"
+
+  if [[ ! -f "$zip_path" ]]; then
+    echo "Font archive not found: $zip_path"
+    return 0
+  fi
+
+  if [[ "$MODE" != "yolo" ]]; then
+    if ! prompt_yes_no "Install Sauce Code Pro fonts from $zip_path?" "y"; then
+      return 0
+    fi
+  fi
+
+  ensure_command unzip unzip || return 0
+  mkdir -p "$dest_dir"
+  unzip -o "$zip_path" -d "$dest_dir" >/dev/null
+  if command -v fc-cache >/dev/null 2>&1; then
+    fc-cache -f "$dest_dir" || true
+  fi
 }
 
 sync_ghostty() {
@@ -338,25 +377,25 @@ atuin_import_bash() {
   if ! command -v atuin >/dev/null 2>&1; then
     return 0
   fi
-  if prompt_yes_no "Import default bash history into atuin now?" "y"; then
+  if [[ "$MODE" == "yolo" ]] || prompt_yes_no "Import default bash history into atuin now?" "y"; then
     atuin import bash || true
   fi
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --install-all)
-      INSTALL_NEOVIM=1
-      INSTALL_TMUX=1
-      INSTALL_ATUIN=1
-      INSTALL_GHOSTTY=1
-      INSTALL_BASE=1
+    --interview)
+      MODE="interview"
       ;;
-    --install-neovim) INSTALL_NEOVIM=1 ;;
-    --install-tmux) INSTALL_TMUX=1 ;;
-    --install-atuin) INSTALL_ATUIN=1 ;;
-    --install-ghostty) INSTALL_GHOSTTY=1 ;;
-    --install-base) INSTALL_BASE=1 ;;
+    --yolo)
+      MODE="yolo"
+      ;;
+    --skip-neovim) SKIP_NEOVIM=1 ;;
+    --skip-tmux) SKIP_TMUX=1 ;;
+    --skip-atuin) SKIP_ATUIN=1 ;;
+    --skip-ghostty) SKIP_GHOSTTY=1 ;;
+    --skip-base) SKIP_BASE=1 ;;
+    --skip-fonts) SKIP_FONTS=1 ;;
     -h|--help)
       usage
       exit 0
@@ -370,20 +409,23 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-if [[ "$INSTALL_BASE" -eq 1 ]]; then
+if [[ "$SKIP_BASE" -ne 1 ]]; then
   install_base
 fi
-if [[ "$INSTALL_NEOVIM" -eq 1 ]]; then
+if [[ "$SKIP_NEOVIM" -ne 1 ]]; then
   install_neovim
 fi
-if [[ "$INSTALL_TMUX" -eq 1 ]]; then
+if [[ "$SKIP_TMUX" -ne 1 ]]; then
   install_tmux
 fi
-if [[ "$INSTALL_ATUIN" -eq 1 ]]; then
+if [[ "$SKIP_ATUIN" -ne 1 ]]; then
   install_atuin
 fi
-if [[ "$INSTALL_GHOSTTY" -eq 1 ]]; then
+if [[ "$SKIP_GHOSTTY" -ne 1 ]]; then
   install_ghostty
+fi
+if [[ "$SKIP_FONTS" -ne 1 ]]; then
+  install_fonts
 fi
 
 sync_ghostty

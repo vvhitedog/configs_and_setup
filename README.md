@@ -11,14 +11,19 @@ Configurations and setup scripts to sync my current environment.
 - Tmux: `setup_tmux/tmux.conf` -> `~/.tmux.conf`
 - Bash: `setup_bash/bashrc` -> sourced from `~/.bashrc` (history handled by Atuin; no inputrc)
 - Atuin: `setup_atuin/config.toml` -> `~/.config/atuin/config.toml`
+- Fonts: `setup_terminator/sauce_code_fonts.zip` -> `~/.local/share/fonts/sauce_code_pro`
 
 ## Setup script (Ubuntu)
-`setup_ubuntu.sh` prompts before installs/overwrites and focuses on Ghostty, Neovim (incl. local plugins), Atuin, tmux, and bash.
-It also offers to install vim-plug and import bash history into Atuin.
+`setup_ubuntu.sh` supports two modes:
+- interview mode (default): asks about installs and overwrites
+- yolo mode: installs and overwrites without prompts
+
+It focuses on Ghostty, Neovim (incl. local plugins), Atuin, tmux, and bash, installs Sauce Code Pro fonts, offers vim-plug install, and can import bash history into Atuin.
 
 Examples:
 - `./setup_ubuntu.sh`
-- `./setup_ubuntu.sh --install-all --install-base`
+- `./setup_ubuntu.sh --yolo`
+- `./setup_ubuntu.sh --skip-neovim --skip-ghostty`
 - `./setup_ubuntu.sh --install-neovim --install-tmux --install-atuin --install-ghostty --install-base`
 
 ## Atuin history import

@@ -52,7 +52,6 @@
 cursor-style-blink = true
 cursor-style = "block"
 
-font-family = ""
 font-family = "SauceCodePro Nerd Font Mono"
 
 app-notifications = no-clipboard-copy
