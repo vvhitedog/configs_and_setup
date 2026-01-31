@@ -12,6 +12,10 @@ SKIP_BASE=0
 SKIP_FONTS=0
 
 APT_UPDATED=0
+MIN_NVIM_VERSION="0.9.5"
+MIN_NODE_VERSION="16.18.0"
+MIN_NPM_VERSION="8.0.0"
+MIN_YARN_VERSION="1.22.0"
 
 usage() {
   cat <<'EOF'
@@ -86,6 +90,65 @@ ensure_command() {
   else
     return 1
   fi
+}
+
+clean_version() {
+  echo "$1" | sed -E 's/^[^0-9]*//; s/^[0-9]+://; s/[^0-9.].*$//'
+}
+
+version_ge() {
+  local a="$1"
+  local b="$2"
+  if [[ -z "$a" || -z "$b" ]]; then
+    return 1
+  fi
+  [[ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n1)" == "$b" ]]
+}
+
+get_installed_nvim_version() {
+  if ! command -v nvim >/dev/null 2>&1; then
+    return 0
+  fi
+  nvim --version 2>/dev/null | head -n1 | sed -E 's/^NVIM v?//; s/[^0-9.].*$//'
+}
+
+get_apt_nvim_version() {
+  local cand
+  cand="$(apt-cache policy neovim 2>/dev/null | awk -F': ' '/Candidate:/ {print $2}')"
+  if [[ -z "$cand" || "$cand" == "(none)" ]]; then
+    return 0
+  fi
+  clean_version "$cand"
+}
+
+get_snap_nvim_version() {
+  if ! command -v snap >/dev/null 2>&1; then
+    return 0
+  fi
+  local ver
+  ver="$(snap info nvim 2>/dev/null | awk '/latest\/stable:/ {print $2; exit} /stable:/ {print $2; exit}')"
+  clean_version "$ver"
+}
+
+get_node_version() {
+  if ! command -v node >/dev/null 2>&1; then
+    return 0
+  fi
+  node --version 2>/dev/null | sed -E 's/^v//; s/[^0-9.].*$//'
+}
+
+get_npm_version() {
+  if ! command -v npm >/dev/null 2>&1; then
+    return 0
+  fi
+  npm --version 2>/dev/null | sed -E 's/[^0-9.].*$//'
+}
+
+get_yarn_version() {
+  if ! command -v yarn >/dev/null 2>&1; then
+    return 0
+  fi
+  yarn --version 2>/dev/null | sed -E 's/[^0-9.].*$//'
 }
 
 copy_file() {
@@ -215,16 +278,52 @@ ensure_bashrc_block() {
 }
 
 install_neovim() {
-  if command -v nvim >/dev/null 2>&1; then
-    if ! prompt_yes_no "Neovim already installed. Reinstall/upgrade?" "y"; then
+  local installed_ver apt_ver snap_ver recommended_source recommended_ver
+  installed_ver="$(get_installed_nvim_version)"
+  apt_ver="$(get_apt_nvim_version)"
+  snap_ver="$(get_snap_nvim_version)"
+
+  echo "Neovim versions: installed=${installed_ver:-none}, apt=${apt_ver:-none}, snap=${snap_ver:-none} (need >= ${MIN_NVIM_VERSION})"
+
+  if [[ -n "$apt_ver" ]] && version_ge "$apt_ver" "$MIN_NVIM_VERSION"; then
+    recommended_source="apt"
+    recommended_ver="$apt_ver"
+  fi
+  if [[ -n "$snap_ver" ]] && version_ge "$snap_ver" "$MIN_NVIM_VERSION"; then
+    if [[ -z "$recommended_ver" || version_ge "$snap_ver" "$recommended_ver" ]]; then
+      recommended_source="snap"
+      recommended_ver="$snap_ver"
+    fi
+  fi
+
+  if [[ -z "$recommended_source" ]]; then
+    echo "WARNING: No apt or snap Neovim version meets ${MIN_NVIM_VERSION}."
+    echo "Available: apt=${apt_ver:-none}, snap=${snap_ver:-none}"
+    if ! prompt_yes_no "Install the newest available Neovim anyway?" "y"; then
+      return 0
+    fi
+    if [[ -n "$snap_ver" && ( -z "$apt_ver" || version_ge "$snap_ver" "$apt_ver" ) ]]; then
+      recommended_source="snap"
+      recommended_ver="$snap_ver"
+    elif [[ -n "$apt_ver" ]]; then
+      recommended_source="apt"
+      recommended_ver="$apt_ver"
+    else
+      echo "No Neovim package found in apt or snap."
       return 0
     fi
   else
-    if ! prompt_yes_no "Install neovim?" "y"; then
+    if ! prompt_yes_no "Install/upgrade Neovim via ${recommended_source} (v${recommended_ver})?" "y"; then
       return 0
     fi
   fi
-  apt_install neovim
+
+  if [[ "$recommended_source" == "snap" ]]; then
+    ensure_command snap snapd || return 0
+    sudo snap install nvim --classic
+  else
+    apt_install neovim
+  fi
 }
 
 install_tmux() {
@@ -311,6 +410,50 @@ install_vim_plug() {
   fi
 
   bash "$SCRIPT_DIR/setup_neovim/install_vim_plug"
+}
+
+install_node_tooling() {
+  local node_ver npm_ver yarn_ver
+  node_ver="$(get_node_version)"
+  npm_ver="$(get_npm_version)"
+  yarn_ver="$(get_yarn_version)"
+
+  echo "Node tooling: node=${node_ver:-none} (>=${MIN_NODE_VERSION}), npm=${npm_ver:-none} (>=${MIN_NPM_VERSION}), yarn=${yarn_ver:-none} (>=${MIN_YARN_VERSION})"
+
+  if [[ -z "$node_ver" || ! version_ge "$node_ver" "$MIN_NODE_VERSION" ]]; then
+    echo "CoC requires Node.js >= ${MIN_NODE_VERSION}."
+    if prompt_yes_no "Install Node.js LTS via NodeSource (adds apt repo)?" "y"; then
+      ensure_command curl curl || return 0
+      curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+      apt_install nodejs
+      node_ver="$(get_node_version)"
+      npm_ver="$(get_npm_version)"
+    else
+      echo "Skipping Node.js install; CoC may not work."
+      return 0
+    fi
+  fi
+
+  if [[ -z "$npm_ver" || ! version_ge "$npm_ver" "$MIN_NPM_VERSION" ]]; then
+    if prompt_yes_no "Update npm to the latest (global)?" "y"; then
+      sudo npm install -g npm@latest || true
+      npm_ver="$(get_npm_version)"
+    fi
+  fi
+
+  yarn_ver="$(get_yarn_version)"
+  if [[ -z "$yarn_ver" || ! version_ge "$yarn_ver" "$MIN_YARN_VERSION" ]]; then
+    if command -v corepack >/dev/null 2>&1; then
+      if prompt_yes_no "Enable corepack and install Yarn (stable)?" "y"; then
+        corepack enable || true
+        corepack prepare yarn@stable --activate || true
+      fi
+    else
+      if prompt_yes_no "Install yarn via npm (global)?" "y"; then
+        sudo npm install -g yarn || true
+      fi
+    fi
+  fi
 }
 
 install_fonts() {
@@ -415,6 +558,7 @@ if [[ "$SKIP_BASE" -ne 1 ]]; then
 fi
 if [[ "$SKIP_NEOVIM" -ne 1 ]]; then
   install_neovim
+  install_node_tooling
 fi
 if [[ "$SKIP_TMUX" -ne 1 ]]; then
   install_tmux
