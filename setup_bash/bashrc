@@ -1,23 +1,14 @@
-# Load inputrc
-export INPUTRC=~/.inputrc
+[ -f ~/.fzf.bash ] && source ~/.fzf.bash
+export FZF_DEFAULT_OPTS="--algo=v2 --scheme=history --tiebreak=chunk,begin,length,index"
+export FZF_DEFAULT_COMMAND='rg --files --no-ignore --hidden --follow --glob "!.git/*"'
+bind -x '"\C-p": vim $(fzf);'
 
-# Ignore multiple entries of the same command in history
-export HISTCONTROL=ignoreboth
+export PATH="$HOME/.local/bin:$PATH"
+export EDITOR=nvim
 
-export EDITOR=vim
+. "$HOME/.atuin/bin/env"
+[[ -f ~/.bash-preexec.sh ]] && source ~/.bash-preexec.sh
+eval "$(atuin init bash)"
 
-
-# Following is taken from: https://stackoverflow.com/a/19533853
-# Eternal bash history.
-# ---------------------
-# Undocumented feature which sets the size to "unlimited".
-# http://stackoverflow.com/questions/9457233/unlimited-bash-history
-export HISTFILESIZE=
-export HISTSIZE=
-export HISTTIMEFORMAT="[%F %T] "
-# Change the file location because certain bash sessions truncate .bash_history file upon close.
-# http://superuser.com/questions/575479/bash-history-truncated-to-500-lines-on-each-login
-export HISTFILE=~/.bash_eternal_history
-# Force prompt to write history after every command.
-# http://superuser.com/questions/20900/bash-history-loss
-PROMPT_COMMAND="history -a; $PROMPT_COMMAND"
+# Workaround for Ghostty cursor bug - re-exec bash once on startup
+[[ -z "$GHOSTTY_CURSOR_WORKAROUND" ]] && export GHOSTTY_CURSOR_WORKAROUND=1 && exec bash

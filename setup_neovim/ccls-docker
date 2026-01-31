@@ -1,0 +1,10 @@
+#!/bin/bash
+# Wrapper to run ccls from Docker container
+# Set CCLS_CONTAINER env var to specify container name; run host ccls if unset
+
+if [[ -n "${CCLS_CONTAINER:-}" ]]; then
+  # Execute ccls inside the container as 'hostuser', passing through stdin/stdout
+  exec docker exec -u hostuser -i "$CCLS_CONTAINER" /home/hostuser/software/ccls/Release/ccls "$@"
+else
+  exec ccls "$@"
+fi

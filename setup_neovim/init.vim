@@ -6,11 +6,14 @@ set tags=./tags;
 function! FindNearestTagsFile()
   let l:dir = expand('%:p:h')
   let l:pwd = getcwd()
+  if l:dir =~# '^\w\+://'
+    return ''
+  endif
   while 1
     if filereadable(l:dir . '/tags')
       return l:dir . '/tags'
     endif
-    if l:dir ==# l:pwd || l:dir ==# '/'
+    if l:dir ==# l:pwd || l:dir ==# '/' || fnamemodify(l:dir, ':h') ==# l:dir
       break
     endif
     let l:dir = fnamemodify(l:dir, ':h')
@@ -22,7 +25,7 @@ function! FindNearestTagsFile()
   return ''
 endfunction
 
-autocmd BufEnter * let &tags = FindNearestTagsFile()
+autocmd BufEnter * if &buftype ==# '' && expand('%:p') !~# '^\w\+://' | let &tags = FindNearestTagsFile() | endif
 
 "Turn on filetype plugins and indentation
 filetype indent plugin on
@@ -107,6 +110,8 @@ if !&diff
     Plug 'jremmen/vim-ripgrep'
     Plug 'sjl/vitality.vim'
     Plug 'Yggdroot/LeaderF', { 'do': ':LeaderfInstallCExtension' }
+    Plug 'Makaze/AnsiEsc'
+    Plug 'm-pilia/vim-ccls'
 endif
 
 " These are colorschemes so okay to have in diff
@@ -114,9 +119,11 @@ Plug 'morhetz/gruvbox'
 Plug 'tyrannicaltoucan/vim-quantum'
 Plug 'joshdick/onedark.vim'
 Plug 'bfrg/vim-cpp-modern'
+Plug 'ryanoasis/vim-devicons' " installs icons for plugins to use
 
 " Initialize plugin system
 call plug#end()
+
 
 " ==================================================================================================================================================
 " Specifc to plugins and filetypes
@@ -149,6 +156,14 @@ inoremap <silent><expr> <Tab>
 inoremap <expr> <Tab> coc#pum#visible() ? coc#pum#next(1) : "\<Tab>"
 inoremap <expr> <S-Tab> coc#pum#visible() ? coc#pum#prev(1) : "\<S-Tab>"
 
+" ============================
+" Integrate LeaderF with CoC
+" ============================
+" Enable popup preview
+let g:Lf_PreviewInPopup = 1
+"let g:Lf_WindowPosition = 'popup'
+let g:Lf_HideHelp = 1
+
 " Check that we are not in diff or preview window modes
 if !&diff && !&pvw 
 
@@ -160,24 +175,34 @@ if !&diff && !&pvw
     inoremap <F7> <Esc> :%!clang-format <CR>
     nnoremap <F7>  :%!clang-format <CR>
 
+
+    " Use  CoC built-in functionality (as opposed to leaderf below)
     nmap <silent> <C-l> :TagbarClose<cr><Plug>(coc-declaration)
     nmap <silent> <C-j> :TagbarClose<cr><Plug>(coc-definition)
-    nmap <silent> <C-k> :TagbarClose<cr><Plug>(coc-references)
+    "nmap <silent> <C-k> :TagbarClose<cr><Plug>(coc-references)
+    nnoremap <silent> <M-m> :CocList outline<cr>
+    nmap <silent> <C-n> :CocList symbols<cr>
+
+    " Use Leaderf for some functionality if its slicker
+    " necessary due to how slow CoC is) Note, the integration is worse.
+    "nmap <silent> <C-l> :TagbarClose<cr>:Leaderf! coc declarations --auto-jump <CR>
+    "nmap <silent> <C-j> :TagbarClose<cr>:Leaderf! coc definitions --auto-jump<CR>
+    nmap <silent> <C-k> :TagbarClose<cr>:Leaderf! coc references <CR>
+    "nmap <silent> <C-t> :TagbarClose<cr>:Leaderf! coc typeDefinitions<CR>
+
     nnoremap <silent> <C-M-j> :TagbarClose<cr>:call CocAction('jumpImplementation')<CR>
 
-    nnoremap <silent> <M-m> :CocList outline<cr>
 
 
-    nn <silent> <M-l> :Leaderf line --fuzzy<cr>
-    nn <silent> <M-r> :Leaderf rg --fuzzy<cr>
+    nn <silent> <M-l> :Leaderf line --regexMode<cr>
+    nn <silent> <M-r> :Leaderf rg --regexMode<cr>
 
 
     nmap <silent> <M-n> :LfTagIncremental<cr>
-    nmap <silent> <C-n> :CocList symbols<cr>
-    nmap <silent> <C-h> :CocList --interactive symbols -kind class<cr>
-    nmap <silent> <C-f> :Leaderf file --no-ignore --fuzzy<cr>
-    nmap <silent> <C-M-f> :Leaderf! file --no-ignore --fuzzy<cr>
-    nmap <silent> <C-g> :Leaderf mru --fuzzy<cr>
+    "nmap <silent> <C-h> :CocList --interactive symbols -kind class<cr>
+    nmap <silent> <C-f> :Leaderf file --no-ignore --regexMode<cr>
+    nmap <silent> <C-M-f> :Leaderf! file --no-ignore --regexMode<cr>
+    nmap <silent> <C-g> :Leaderf mru --regexMode<cr>
 
     function! OpenGithubUrl(branch)
       " Get repo remote URL
@@ -655,9 +680,9 @@ autocmd BufReadPost quickfix nnoremap <buffer> <CR> <CR>
 set previewheight=25
 nmap <M-]> <C-w>}<C-w><C-w>
 
-"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 "" COLORS AND DISPLAY:
-"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 set termguicolors
 colorscheme onedark
 
@@ -672,11 +697,17 @@ hi TabLineFill guifg=#14161a guibg=#676b73
 hi Title guibg=#282c34 guifg=#abb2bf
 hi TabLineNC guibg=#dae2f2 guifg=#74a0f7
 
-hi Normal guibg=#1D282E
 
-"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+" Normal bg
+hi Normal guibg=#1b2128
+" helps visualize active windows
+autocmd FocusLost * hi Normal guibg=#0e191f
+autocmd FocusGained * hi Normal guibg=#1b2128
+
+
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 "" FIX TABLLINE TO SHOW NUMBERS:
-"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 " Rename tabs to show tab number.
 " (Based on http://stackoverflow.com/questions/5927952/whats-implementation-of-vims-default-tabline-function)
 " taken from https://superuser.com/a/477221/734404
@@ -736,9 +767,6 @@ set colorcolumn=80
 
 set cursorline
 
-" helps visualize active windows
-autocmd FocusLost * hi Normal guibg=#0e191f
-autocmd FocusGained * hi Normal guibg=#1D282E
 
 function! ConfirmQuit(all)
     let l:confirmed = confirm("Terminal(s) may be open, do you really want to quit?", "&Yes\n&No", 2)
@@ -758,5 +786,151 @@ au termopen * cnoremap <silent> qa<cr> call ConfirmQuit(1)<cr>
 au termenter * cnoremap <silent> qa<cr> call ConfirmQuit(1)<cr>
 au termleave * cnoremap <silent> qa<cr> call ConfirmQuit(1)<cr>
 
-let g:coc_global_extensions = ['coc-json', 'coc-tsserver', 'coc-clangd', 'coc-pyright']
-autocmd FileType java call CocActionAsync('runCommand', 'extension.coc-java.activate')
+"let g:coc_global_extensions = ['coc-json', 'coc-tsserver', 'coc-clangd', 'coc-pyright']
+let g:coc_global_extensions = ['coc-json', 'coc-tsserver', 'coc-pyright']
+"autocmd FileType java call CocActionAsync('runCommand', 'extension.coc-java.activate')
+
+" =========================================================================================
+" keymap-cheatsheet.nvim (descriptions without rewriting mappings)
+" =========================================================================================
+if !exists('g:keymap_cheatsheet_desc')
+  let g:keymap_cheatsheet_desc = {}
+endif
+
+if !has_key(g:keymap_cheatsheet_desc, 'n') | let g:keymap_cheatsheet_desc.n = {} | endif
+call extend(g:keymap_cheatsheet_desc.n, {
+\ '<leader>y': 'Yank into register 0 (preserve last yank)',
+\ '<leader>p': 'Paste from register 0 (preserve last yank)',
+\ '[m': 'Jump to previous method/function name',
+\ ']m': 'Jump to next method/function name',
+\ '<F7>': 'Format buffer through clang-format',
+\ '<C-l>': 'Go to declaration (close Tagbar first)',
+\ '<C-j>': 'Go to definition (close Tagbar first)',
+\ '<C-k>': 'Find references (LeaderF + CoC; close Tagbar first)',
+\ '<C-M-j>': 'Jump to implementation (close Tagbar first)',
+\ '<M-m>': 'Outline list (CocList outline)',
+\ '<C-n>': 'Workspace symbols (CocList symbols)',
+\ '<M-l>': 'Search lines in current buffer (LeaderF line)',
+\ '<M-r>': 'Ripgrep project search (LeaderF rg)',
+\ '<M-n>': 'Incremental tags update + tag search (LeaderF tag)',
+\ '<C-f>': 'Find files (LeaderF file, includes ignored)',
+\ '<C-M-f>': 'Find files (LeaderF file, fullscreen, includes ignored)',
+\ '<C-g>': 'Recent files (LeaderF mru)',
+\ '<M-v>': 'Open current file on GitHub at cursor line (current branch)',
+\ '<M-V>': 'Open current file on GitHub at cursor line (master branch)',
+\ '<M-c>': 'Copy absolute path:line to clipboard',
+\ 'K': 'Show hover documentation (CoC)',
+\ '<leader>r': 'Rename symbol (CoC)',
+\ '<leader>qf': 'Quickfix current issue (CoC)',
+\ '<C-b>': 'Open 3-way git diff viewer for current file',
+\ '<M-o>': 'Open Tagbar outline',
+\ '<M-t>': 'Toggle Tagbar',
+\ '<M-k>': 'Close Tagbar and open CoC outline',
+\ '<M-f>': 'Diff current file vs default base (GitDiffWin)',
+\ '<M-F>': 'Diff current file vs origin/HEAD (GitDiffWin)',
+\ '<M-s>': 'Open file under cursor and diff vs default base',
+\ '<M-S>': 'Open file under cursor and diff vs origin/HEAD',
+\ '<M-z>': 'List changed files vs HEAD (GitDiffFiles)',
+\ '<M-Z>': 'List changed files vs origin/HEAD (GitDiffFiles)',
+\ '<M-h>': 'Git blame in a scratch window',
+\ '<M-1>': 'Go to tab 1',
+\ '<M-2>': 'Go to tab 2',
+\ '<M-3>': 'Go to tab 3',
+\ '<M-4>': 'Go to tab 4',
+\ '<M-5>': 'Go to tab 5',
+\ '<M-6>': 'Go to tab 6',
+\ '<M-7>': 'Go to tab 7',
+\ '<M-8>': 'Go to tab 8',
+\ '<M-9>': 'Go to tab 9',
+\ '<C-s>': 'Cycle to previous tab (g<Tab>)',
+\ '<C-a>': 'Escape / leave current mode',
+\ '<A-j>': 'Open buffer switcher (LeaderF buffer)',
+\ '<C-x><C-x>': 'Open window picker (LeaderF window)',
+\ '<M-]>': 'Preview tag under cursor in preview window',
+\ '<C-q>': 'Close current tab',
+\ }, 'keep')
+
+if !has_key(g:keymap_cheatsheet_desc, 'i') | let g:keymap_cheatsheet_desc.i = {} | endif
+call extend(g:keymap_cheatsheet_desc.i, {
+\ '<CR>': 'Confirm completion if menu visible, otherwise insert newline (CoC)',
+\ '<Tab>': 'Next completion item if menu visible, otherwise Tab (CoC)',
+\ '<S-Tab>': 'Previous completion item if menu visible (CoC)',
+\ '<c-space>': 'Trigger completion refresh (CoC)',
+\ '<F7>': 'Format buffer through clang-format',
+\ '<M-1>': 'Go to tab 1',
+\ '<M-2>': 'Go to tab 2',
+\ '<M-3>': 'Go to tab 3',
+\ '<M-4>': 'Go to tab 4',
+\ '<M-5>': 'Go to tab 5',
+\ '<M-6>': 'Go to tab 6',
+\ '<M-7>': 'Go to tab 7',
+\ '<M-8>': 'Go to tab 8',
+\ '<M-9>': 'Go to tab 9',
+\ '<C-s>': 'Cycle to previous tab (g<Tab>)',
+\ '<C-a>': 'Escape to normal mode',
+\ '<A-j>': 'Open buffer switcher (LeaderF buffer)',
+\ '<C-x><C-x>': 'Open window picker (LeaderF window)',
+\ }, 'keep')
+
+if !has_key(g:keymap_cheatsheet_desc, 'v') | let g:keymap_cheatsheet_desc.v = {} | endif
+call extend(g:keymap_cheatsheet_desc.v, {
+\ '<leader>y': 'Yank selection into register 0 (preserve last yank)',
+\ '<leader>p': 'Paste from register 0 (preserve last yank)',
+\ '<M-1>': 'Go to tab 1',
+\ '<M-2>': 'Go to tab 2',
+\ '<M-3>': 'Go to tab 3',
+\ '<M-4>': 'Go to tab 4',
+\ '<M-5>': 'Go to tab 5',
+\ '<M-6>': 'Go to tab 6',
+\ '<M-7>': 'Go to tab 7',
+\ '<M-8>': 'Go to tab 8',
+\ '<M-9>': 'Go to tab 9',
+\ '<C-s>': 'Cycle to previous tab (g<Tab>)',
+\ '<C-a>': 'Escape / leave visual mode',
+\ '<A-j>': 'Open buffer switcher (LeaderF buffer)',
+\ '<C-x><C-x>': 'Open window picker (LeaderF window)',
+\ }, 'keep')
+
+if !has_key(g:keymap_cheatsheet_desc, 'o') | let g:keymap_cheatsheet_desc.o = {} | endif
+call extend(g:keymap_cheatsheet_desc.o, {
+\ '<leader>y': 'Yank operator into register 0 (preserve last yank)',
+\ '<leader>p': 'Paste from register 0 (preserve last yank)',
+\ }, 'keep')
+
+if !has_key(g:keymap_cheatsheet_desc, 't') | let g:keymap_cheatsheet_desc.t = {} | endif
+call extend(g:keymap_cheatsheet_desc.t, {
+\ '<M-1>': 'Go to tab 1 (leave terminal mode first)',
+\ '<M-2>': 'Go to tab 2 (leave terminal mode first)',
+\ '<M-3>': 'Go to tab 3 (leave terminal mode first)',
+\ '<M-4>': 'Go to tab 4 (leave terminal mode first)',
+\ '<M-5>': 'Go to tab 5 (leave terminal mode first)',
+\ '<M-6>': 'Go to tab 6 (leave terminal mode first)',
+\ '<M-7>': 'Go to tab 7 (leave terminal mode first)',
+\ '<M-8>': 'Go to tab 8 (leave terminal mode first)',
+\ '<M-9>': 'Go to tab 9 (leave terminal mode first)',
+\ '<C-s>': 'Cycle to previous tab (g<Tab>; leave terminal mode first)',
+\ '<C-a>': 'Leave terminal mode',
+\ '<A-j>': 'Open buffer switcher (LeaderF buffer)',
+\ '<C-x><C-x>': 'Open window picker (LeaderF window)',
+\ }, 'keep')
+
+if !has_key(g:keymap_cheatsheet_desc, 'c') | let g:keymap_cheatsheet_desc.c = {} | endif
+call extend(g:keymap_cheatsheet_desc.c, {
+\ 'q<cr>': 'Confirm quit when terminals may be open',
+\ 'qa<cr>': 'Confirm quit-all when terminals may be open',
+\ }, 'keep')
+
+lua << EOF
+require("gitdiffiles").setup({
+  log_max = 200,
+  ui = { file_width = 50, open_in_tab = false },
+  keys = {
+    open = "<CR>",
+    refresh = "r",
+    quit = "q",
+    set_source = "s",
+    set_target = "t",
+  },
+})
+EOF
+
