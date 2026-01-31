@@ -16,6 +16,9 @@ MIN_NVIM_VERSION="0.9.5"
 MIN_NODE_VERSION="16.18.0"
 MIN_NPM_VERSION="8.0.0"
 MIN_YARN_VERSION="1.22.0"
+NPM_PREFIX="$HOME/.local"
+
+export PATH="$HOME/.local/bin:$PATH"
 
 usage() {
   cat <<'EOF'
@@ -103,6 +106,13 @@ version_ge() {
     return 1
   fi
   [[ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n1)" == "$b" ]]
+}
+
+ensure_dir() {
+  local dir="$1"
+  if [[ -n "$dir" ]]; then
+    mkdir -p "$dir"
+  fi
 }
 
 get_installed_nvim_version() {
@@ -412,6 +422,43 @@ install_vim_plug() {
   bash "$SCRIPT_DIR/setup_neovim/install_vim_plug"
 }
 
+npm_global_install() {
+  local pkg="$1"
+  local log=""
+  ensure_dir "$NPM_PREFIX"
+  log="$(mktemp)"
+  if npm install -g "$pkg" --prefix "$NPM_PREFIX" >"$log" 2>&1; then
+    rm -f "$log"
+    return 0
+  fi
+  echo "npm install -g $pkg failed under ${NPM_PREFIX}. See $log"
+  if prompt_yes_no "Retry npm install -g $pkg with sudo?" "n"; then
+    local sudo_log
+    sudo_log="$(mktemp)"
+    if sudo npm install -g "$pkg" >"$sudo_log" 2>&1; then
+      rm -f "$sudo_log"
+    else
+      echo "sudo npm install -g $pkg failed. See $sudo_log"
+    fi
+  fi
+}
+
+run_plug_install() {
+  local plug_path="$HOME/.local/share/nvim/site/autoload/plug.vim"
+  if [[ ! -f "$plug_path" ]]; then
+    return 0
+  fi
+  if ! command -v nvim >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ "$MODE" != "yolo" ]]; then
+    if ! prompt_yes_no "Run :PlugInstall now to fetch Neovim plugins?" "y"; then
+      return 0
+    fi
+  fi
+  nvim --headless +PlugInstall +qall || true
+}
+
 install_node_tooling() {
   local node_ver npm_ver yarn_ver
   node_ver="$(get_node_version)"
@@ -436,7 +483,7 @@ install_node_tooling() {
 
   if [[ -z "$npm_ver" ]] || ! version_ge "$npm_ver" "$MIN_NPM_VERSION"; then
     if prompt_yes_no "Update npm to the latest (global)?" "y"; then
-      sudo npm install -g npm@latest || true
+      npm_global_install "npm@latest"
       npm_ver="$(get_npm_version)"
     fi
   fi
@@ -445,12 +492,23 @@ install_node_tooling() {
   if [[ -z "$yarn_ver" ]] || ! version_ge "$yarn_ver" "$MIN_YARN_VERSION"; then
     if command -v corepack >/dev/null 2>&1; then
       if prompt_yes_no "Enable corepack and install Yarn (stable)?" "y"; then
-        corepack enable || true
-        corepack prepare yarn@stable --activate || true
+        local cp_log
+        cp_log="$(mktemp)"
+        if ! corepack enable >"$cp_log" 2>&1; then
+          echo "corepack enable failed. See $cp_log"
+        else
+          rm -f "$cp_log"
+        fi
+        cp_log="$(mktemp)"
+        if ! corepack prepare yarn@stable --activate >"$cp_log" 2>&1; then
+          echo "corepack prepare failed. See $cp_log"
+        else
+          rm -f "$cp_log"
+        fi
       fi
     else
       if prompt_yes_no "Install yarn via npm (global)?" "y"; then
-        sudo npm install -g yarn || true
+        npm_global_install "yarn"
       fi
     fi
   fi
@@ -580,5 +638,6 @@ sync_atuin
 sync_tmux
 sync_bash
 atuin_import_bash
+run_plug_install
 
 echo "Done."

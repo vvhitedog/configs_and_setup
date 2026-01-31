@@ -22,6 +22,7 @@ It focuses on Ghostty, Neovim (incl. local plugins), Atuin, tmux, and bash, inst
 Ghostty is installed via apt if available; otherwise the script falls back to snap (`snap install ghostty --classic`).
 Neovim prefers a version >= 0.9.5; the script checks apt/snap versions and installs the newest option that meets this requirement when available.
 CoC requires Node.js >= 16.18.0; the script can install Node.js LTS, update npm, and install Yarn if needed.
+After installing vim-plug, the script can run `:PlugInstall` once in headless mode.
 
 Examples:
 - `./setup_ubuntu.sh`
