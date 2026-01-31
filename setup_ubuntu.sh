@@ -278,7 +278,7 @@ ensure_bashrc_block() {
 }
 
 install_neovim() {
-  local installed_ver apt_ver snap_ver recommended_source recommended_ver
+  local installed_ver="" apt_ver="" snap_ver="" recommended_source="" recommended_ver=""
   installed_ver="$(get_installed_nvim_version)"
   apt_ver="$(get_apt_nvim_version)"
   snap_ver="$(get_snap_nvim_version)"
