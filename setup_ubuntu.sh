@@ -290,7 +290,7 @@ install_neovim() {
     recommended_ver="$apt_ver"
   fi
   if [[ -n "$snap_ver" ]] && version_ge "$snap_ver" "$MIN_NVIM_VERSION"; then
-    if [[ -z "$recommended_ver" || version_ge "$snap_ver" "$recommended_ver" ]]; then
+    if [[ -z "$recommended_ver" ]] || version_ge "$snap_ver" "$recommended_ver"; then
       recommended_source="snap"
       recommended_ver="$snap_ver"
     fi
@@ -302,7 +302,7 @@ install_neovim() {
     if ! prompt_yes_no "Install the newest available Neovim anyway?" "y"; then
       return 0
     fi
-    if [[ -n "$snap_ver" && ( -z "$apt_ver" || version_ge "$snap_ver" "$apt_ver" ) ]]; then
+    if [[ -n "$snap_ver" ]] && { [[ -z "$apt_ver" ]] || version_ge "$snap_ver" "$apt_ver"; }; then
       recommended_source="snap"
       recommended_ver="$snap_ver"
     elif [[ -n "$apt_ver" ]]; then
@@ -420,7 +420,7 @@ install_node_tooling() {
 
   echo "Node tooling: node=${node_ver:-none} (>=${MIN_NODE_VERSION}), npm=${npm_ver:-none} (>=${MIN_NPM_VERSION}), yarn=${yarn_ver:-none} (>=${MIN_YARN_VERSION})"
 
-  if [[ -z "$node_ver" || ! version_ge "$node_ver" "$MIN_NODE_VERSION" ]]; then
+  if [[ -z "$node_ver" ]] || ! version_ge "$node_ver" "$MIN_NODE_VERSION"; then
     echo "CoC requires Node.js >= ${MIN_NODE_VERSION}."
     if prompt_yes_no "Install Node.js LTS via NodeSource (adds apt repo)?" "y"; then
       ensure_command curl curl || return 0
@@ -434,7 +434,7 @@ install_node_tooling() {
     fi
   fi
 
-  if [[ -z "$npm_ver" || ! version_ge "$npm_ver" "$MIN_NPM_VERSION" ]]; then
+  if [[ -z "$npm_ver" ]] || ! version_ge "$npm_ver" "$MIN_NPM_VERSION"; then
     if prompt_yes_no "Update npm to the latest (global)?" "y"; then
       sudo npm install -g npm@latest || true
       npm_ver="$(get_npm_version)"
@@ -442,7 +442,7 @@ install_node_tooling() {
   fi
 
   yarn_ver="$(get_yarn_version)"
-  if [[ -z "$yarn_ver" || ! version_ge "$yarn_ver" "$MIN_YARN_VERSION" ]]; then
+  if [[ -z "$yarn_ver" ]] || ! version_ge "$yarn_ver" "$MIN_YARN_VERSION"; then
     if command -v corepack >/dev/null 2>&1; then
       if prompt_yes_no "Enable corepack and install Yarn (stable)?" "y"; then
         corepack enable || true
