@@ -281,8 +281,9 @@ install_ghostty() {
     return 0
   fi
 
-  echo "Ghostty package not found in apt."
-  echo "Install manually from https://ghostty.org/ and rerun this script for config sync."
+  echo "Ghostty package not found in apt. Trying snap."
+  ensure_command snap snapd || return 0
+  sudo snap install ghostty --classic
 }
 
 install_base() {

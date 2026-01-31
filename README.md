@@ -19,6 +19,7 @@ Configurations and setup scripts to sync my current environment.
 - yolo mode: installs and overwrites without prompts
 
 It focuses on Ghostty, Neovim (incl. local plugins), Atuin, tmux, and bash, installs Sauce Code Pro fonts, offers vim-plug install, and can import bash history into Atuin.
+Ghostty is installed via apt if available; otherwise the script falls back to snap (`snap install ghostty --classic`).
 
 Examples:
 - `./setup_ubuntu.sh`
