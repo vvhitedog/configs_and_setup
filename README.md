@@ -2,7 +2,7 @@
 Configurations and setup scripts to sync my current environment.
 
 ## Primary synced configs
-- Terminator: `setup_terminator/config` -> `~/.config/terminator/config` (palette matched to tmux/ble.sh)
+- Terminator: `setup_terminator/config` -> `~/.config/terminator/config`
 - Ghostty: `setup_ghostty/config` -> `~/.config/ghostty/config`
 - Neovim: `setup_neovim/init.vim`, `setup_neovim/coc-settings.json`
 - Neovim local plugins: everything under `setup_neovim/local_plugins/*` -> `~/.config/nvim/pack/local/start/`
@@ -38,7 +38,7 @@ Tmux-compose installs `tmux-compose`, `tmux-mru`, `tmux-window-usage`, `tmux-pan
 
 ble.sh is installed from `https://github.com/akinomyoga/ble.sh.git` when missing or when reinstall/update is accepted. It loads before Atuin from the synced bash custom file. Atuin is installed via apt when available, otherwise via the official release binary installer with path modification disabled; shell integration is handled only by `setup_bash/bashrc`. Use `--skip-blesh` to skip ble.sh install and `.blerc` sync.
 
-Directory colors come from two places: `ls` uses Ubuntu `dircolors`/`LS_COLORS` (`di=01;34`, bold ANSI blue), while ble.sh completion uses `setup_bash/blerc` faces such as `filename_directory=fg=#81a1c1,bold`. The terminal palette maps that ANSI blue to the Terminator/tmux palette.
+Directory colors come from two places: `ls` uses Ubuntu `dircolors`/`LS_COLORS` (`di=01;34`, bold ANSI blue), which Terminator maps to its bright blue palette entry (`#61afef` in this config). ble.sh completion uses explicit faces from `setup_bash/blerc`, such as `filename_directory=fg=#81a1c1,bold`, so completion colors can be more muted than `ls` output.
 
 Neovim prefers version >= 0.9.5. The script installs vim-plug, can run `:PlugInstall`, and copies local pack plugins. CoC requires Node.js >= 16.18.0; the script can install Node.js LTS, update npm, and install Yarn if needed. Optional local binary integrations such as `tagls` and `tsxref` are guarded so Neovim starts cleanly when those binaries are not installed.
 
