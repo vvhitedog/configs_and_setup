@@ -24,7 +24,7 @@ MIN_NPM_VERSION="8.0.0"
 MIN_YARN_VERSION="1.22.0"
 NPM_PREFIX="$HOME/.local"
 
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.atuin/bin:$HOME/.cargo/bin:$HOME/.npm-global/bin:$PATH"
 
 usage() {
   cat <<'EOF'
@@ -440,9 +440,22 @@ install_atuin() {
     echo "Skipping atuin install (curl not available)."
     return 0
   fi
+  ensure_command tar tar || return 0
 
-  echo "Installing atuin via upstream install script."
-  curl -fsSL https://raw.githubusercontent.com/atuinsh/atuin/main/install.sh | bash
+  local tmp=""
+  tmp="$(mktemp -d)"
+  echo "Installing atuin via the release binary installer (no shell config mutation)."
+  if curl -fsSL --retry 3 -o "$tmp/atuin-installer.sh" \
+      https://github.com/atuinsh/atuin/releases/latest/download/atuin-installer.sh && \
+      ATUIN_NO_MODIFY_PATH=1 ATUIN_DISABLE_UPDATE=1 \
+        sh "$tmp/atuin-installer.sh" --quiet --no-modify-path; then
+    rm -rf "$tmp"
+  else
+    local rc=$?
+    rm -rf "$tmp"
+    echo "WARNING: atuin install failed."
+    return "$rc"
+  fi
 }
 
 install_ghostty() {
