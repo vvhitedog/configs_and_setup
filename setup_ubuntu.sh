@@ -453,11 +453,8 @@ diff_line_count() {
     return 0
   fi
 
-  diff -U0 "$a" "$b" 2>/dev/null \
-    | grep -E '^[+-]' \
-    | grep -v '^[+-]{3} ' \
-    | wc -l \
-    | tr -d ' '
+  { diff -U0 "$a" "$b" 2>/dev/null || true; } \
+    | awk '/^[+-]/ && !/^[+-]{3} / { count++ } END { print count + 0 }'
 }
 
 warn_large_diff() {
