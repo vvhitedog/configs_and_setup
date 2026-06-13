@@ -1,0 +1,33 @@
+# claude-auto-approve configuration
+#
+# Read once at daemon startup. To apply changes:
+#   systemctl --user restart claude-auto-approve
+#
+# Shared safe-bash patterns live in `common.toml`. Anything you put in
+# `safe_patterns` (or the legacy `safe_bash_patterns`) here is appended
+# to the common list — claude-specific extras only.
+
+# Override common's poll interval if you want it different for claude.
+# poll_interval = 1.0
+
+# Tool types to always auto-approve, matched against the prompt header line.
+# Match is "equal to" OR "starts with '<tool> '" OR "starts with '<tool>('".
+# Claude-only — no analogue in common.toml.
+safe_tools = [
+  "Web Fetch",
+  "Web Search",
+  "WebFetch",
+  "WebSearch",
+  "Fetch",
+  "Read",
+  "Grep",
+  "Glob",
+  "Agent",
+  "Edit",
+  "Write",
+  "NotebookEdit",
+]
+
+# Claude-specific bash extras (most patterns live in common.toml).
+# Note: legacy field name `safe_bash_patterns` is also accepted as a fallback.
+safe_patterns = []

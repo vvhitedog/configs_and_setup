@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""Auto-approve safe Cursor agent permission prompts in tmux panes."""
+
+import os
+import subprocess
+import time
+import re
+import sys
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+from pathlib import Path
+
+
+def _config_dir():
+    xdg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(xdg) / "auto-approve"
+
+
+def _load_toml(path, *, required):
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        if required:
+            print(f"cursor-auto-approve: config not found at {path}", file=sys.stderr)
+            sys.exit(1)
+        return {}
+    except tomllib.TOMLDecodeError as e:
+        print(f"cursor-auto-approve: invalid TOML in {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def load_config():
+    """Merge common.toml (shared) + cursor.toml (daemon-specific extras)."""
+    common_path = _config_dir() / "common.toml"
+    own_path = _config_dir() / "cursor.toml"
+
+    common = _load_toml(common_path, required=False)
+    own = _load_toml(own_path, required=True)
+
+    if "cursor_processes" not in own:
+        print(f"cursor-auto-approve: {own_path} missing required key `cursor_processes`", file=sys.stderr)
+        sys.exit(1)
+
+    safe_patterns = list(common.get("safe_patterns", [])) + list(own.get("safe_patterns", []))
+    poll = float(own.get("poll_interval", common.get("poll_interval", 1.0)))
+
+    return {
+        "safe_patterns": safe_patterns,
+        "cursor_processes": own["cursor_processes"],
+        "poll_interval": poll,
+        "common_path": common_path if common else None,
+        "own_path": own_path,
+    }
+
+
+CONFIG = load_config()
+SAFE_PATTERNS = CONFIG["safe_patterns"]
+CURSOR_PROCESSES = set(CONFIG["cursor_processes"])
+POLL_INTERVAL = CONFIG["poll_interval"]
+CONFIG_PATH = CONFIG["own_path"]
+COMMON_PATH = CONFIG["common_path"]
+
+
+def get_cursor_panes():
+    """Get tmux pane IDs where Cursor agent is the foreground process."""
+    try:
+        out = subprocess.check_output(
+            ["tmux", "list-panes", "-a", "-F",
+             "#{pane_id}\t#{pane_current_command}\t#{pane_mode}"],
+            text=True,
+        )
+        panes = []
+        for line in out.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.split("\t")
+            pane_id = parts[0]
+            fg_cmd = parts[1] if len(parts) > 1 else ""
+            mode = parts[2] if len(parts) > 2 else ""
+            if not mode and fg_cmd in CURSOR_PROCESSES:
+                panes.append(pane_id)
+        return panes
+    except subprocess.CalledProcessError:
+        return []
+
+
+def capture_pane(pane_id, n=500):
+    """Capture scrollback — safe because we only target Cursor agent panes."""
+    try:
+        out = subprocess.check_output(
+            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-500"],
+            text=True,
+        )
+        all_lines = out.rstrip("\n").split("\n")
+        return all_lines[-n:] if len(all_lines) > n else all_lines
+    except subprocess.CalledProcessError:
+        return []
+
+
+def send_keys(pane_id, keys):
+    """Send keys to a tmux pane."""
+    subprocess.run(["tmux", "send-keys", "-t", pane_id, keys])
+
+
+def is_safe(command):
+    """Check if a command matches safe patterns."""
+    cmd = command.strip()
+    for pattern in SAFE_PATTERNS:
+        if re.search(pattern, cmd):
+            return True
+    return False
+
+
+def check_pane(pane_id, last_approved):
+    """Check a Cursor agent pane for a permission prompt and auto-approve if safe.
+
+    Handles two prompt types:
+    1. "Run this command?" — command execution prompt, sends "y"
+    2. "Allow this web fetch?" (or similar) — tool permission prompt, sends "y"
+
+    Uses the same backwards-search strategy as claude-auto-approve:
+    find the approval line near the bottom, then search backwards through
+    the prompt box to identify the tool/command.
+    """
+    now = time.time()
+    if now - last_approved.get(pane_id, 0) < 2.0:
+        return False
+
+    lines = capture_pane(pane_id)
+    bottom = lines[-20:]
+    bottom_text = "\n".join(bottom)
+
+    # --- Type 1: "Run this command?" prompt ---
+    if "Run this command?" in bottom_text and "Run (once)" in bottom_text:
+        command = None
+        for line in reversed(lines):
+            m = re.search(r"Not in allowlist:\s+(.+)", line)
+            if m:
+                command = m.group(1).strip()
+                break
+        if not command:
+            for line in reversed(lines):
+                m = re.search(r"│\s*\$\s+(.+?)\s+in\s+\S", line)
+                if m:
+                    command = m.group(1).strip()
+                    break
+        print(f"  CURSOR-AUTO-APPROVE [{pane_id}] cmd: {(command or 'unknown')[:80]}", flush=True)
+        send_keys(pane_id, "y")
+        last_approved[pane_id] = now
+        return True
+
+    # --- Type 2: "Allow this ..." prompt (web fetch, file edit, etc.) ---
+    # Match the approval indicator near the bottom
+    allow_match = re.search(r"Allow this (.+?)\?", bottom_text)
+    if not allow_match:
+        return False
+    # Must have an actionable option like "→ Fetch (y)" or "→ Allow (y)"
+    if not re.search(r"→\s+.+?\(y\)", bottom_text):
+        return False
+
+    allow_type = allow_match.group(1).strip()
+
+    # Search backwards from the "Allow" line to find the prompt box content
+    # (the tool info above the approval dialog)
+    allow_idx = None
+    for i in range(len(lines) - 1, -1, -1):
+        if "Allow this " in lines[i]:
+            allow_idx = i
+            break
+    if allow_idx is None:
+        return False
+
+    # Search backwards from allow_idx for the prompt box top (─── border)
+    # Collect tool info lines between the box top and the allow dialog
+    tool_info = []
+    for i in range(allow_idx - 1, max(allow_idx - 30, -1), -1):
+        stripped = lines[i].strip()
+        # Stop at the decorative border marking the top of the prompt
+        if "─" * 10 in lines[i]:
+            break
+        # Collect non-empty content lines (strip box chars)
+        content = re.sub(r"^[│┌┐└┘]\s*", "", stripped).rstrip("│┐┘ ")
+        if content:
+            tool_info.append(content)
+
+    desc = "; ".join(reversed(tool_info)) if tool_info else allow_type
+    print(f"  CURSOR-AUTO-APPROVE [{pane_id}] {allow_type}: {desc[:120]}", flush=True)
+    send_keys(pane_id, "y")
+    last_approved[pane_id] = now
+    return True
+
+
+def main():
+    print("cursor-auto-approve: watching tmux panes...")
+    if COMMON_PATH:
+        print(f"  common: {COMMON_PATH}")
+    print(f"  config: {CONFIG_PATH}")
+    print(f"  poll interval: {POLL_INTERVAL}s")
+    print(f"  safe patterns: {len(SAFE_PATTERNS)}")
+    print(f"  cursor processes: {CURSOR_PROCESSES}")
+    print("  press Ctrl-C to stop")
+    print()
+
+    last_approved = {}  # pane_id -> timestamp of last approval
+
+    while True:
+        try:
+            panes = get_cursor_panes()
+            for pane_id in panes:
+                check_pane(pane_id, last_approved)
+            time.sleep(POLL_INTERVAL)
+        except KeyboardInterrupt:
+            print("\nstopped.")
+            sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

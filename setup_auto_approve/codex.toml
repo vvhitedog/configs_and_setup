@@ -1,0 +1,87 @@
+# codex-auto-approve configuration
+#
+# Read once at daemon startup. To apply changes:
+#   systemctl --user restart codex-auto-approve
+#
+# Shared safe-command patterns live in `common.toml`. Anything you put in
+# `safe_patterns` here is appended to the common list (codex-only extras).
+
+# Override common's poll interval if you want it different for codex.
+# Cut ~3x from the shared 1.0s default for snappier approvals.
+poll_interval = 0.33
+
+# Foreground process names that identify a Codex pane.
+# `node` is broad — npm-installed CLIs often appear as `node` after exec.
+# Trim if it causes false-positive scanning of unrelated node panes.
+codex_processes = ["codex", "node"]
+
+# Auto-approve "Would you like to make the following edits?" prompts.
+# Codex doesn't surface file paths in this prompt in a reliably parseable
+# form, so this is unconditional once the prompt is detected. Set to false
+# if Codex starts approving edits you don't want.
+auto_approve_edits = true
+
+# ---------------------------------------------------------------------------
+# APPROVE-ALL MODE
+# ---------------------------------------------------------------------------
+# When true, codex auto-approves ANY command EXCEPT those matching a
+# deny_patterns entry below (a denylist instead of the allowlist). This trusts
+# codex to run essentially anything in its panes. When false, falls back to the
+# allowlist (safe_patterns + common.toml) — the original behavior.
+# Toggle live from the tmux-compose status window (key `a`) or:
+#   tmux-compose --toggle-codex-approve-all
+approve_all = true
+
+# Dangerous commands that must STILL prompt (never auto-approved) in approve-all
+# mode. Matched UNANCHORED (re.search) against the whole command, so a match
+# anywhere — including after && / | / ; — blocks it. Erring toward catching is
+# fine: a false match just makes that command prompt as before. TOML literal
+# strings (single quotes) so backslashes are literal regex.
+deny_patterns = [
+  # privilege escalation
+  '\bsudo\b',
+  '\bdoas\b',
+  '(^|[|;&]\s*)su\b',
+  # NOTE: `rm` is intentionally NOT a deny pattern. The daemon handles it
+  # specially (rm_confined_to_cwd): rm is allowed only when every target stays
+  # inside the codex pane's working directory, else it still prompts.
+  # disk / filesystem destruction
+  '\bmkfs\b', '\bmke2fs\b', '\bdd\b', '\bshred\b', '\bwipefs\b',
+  '\bfdisk\b', '\bsfdisk\b', '\bparted\b', '\bblkdiscard\b',
+  'of=/dev/\w', '>\s*/dev/(sd|nvme|vd|hd|mmcblk|disk|loop)',
+  # mass permission / ownership changes
+  '\bchmod\s+-R\b', '\bchown\s+-R\b', '\bchmod\s+[0-7]*777\b',
+  # system power / state. Anchored to command position ((?:^|[;&|(]\s*)) so
+  # that grepping source for the WORD "reboot"/etc. — a common code search —
+  # isn't mistaken for the command. Optional leading sudo.
+  # NOTE: `shutdown` removed from this list at user request (heavydb code refers
+  # to shutdown handlers constantly, so it's not worth gating).
+  '(?:^|[;&|(]\s*)(sudo\s+)?(reboot|halt|poweroff)\b',
+  '(?:^|[;&|(]\s*)(sudo\s+)?init\s+[06]\b',
+  '\bsystemctl\s+(poweroff|reboot|halt|kexec)\b',
+  # remote code execution: download piped into a shell
+  '\b(curl|wget|fetch)\b[^|]*\|\s*(sudo\s+)?(ba|z|da|k|fi)?sh\b',
+  # fork bomb
+  ':\s*\(\s*\)\s*\{',
+  # wipe all cron jobs
+  '\bcrontab\s+-r\b',
+  # kill everything (killall anchored to command position; kill -1 / pkill -9
+  # are already specific enough not to false-match a code search)
+  '\bkill\s+-9?\s*--?1\b', '(?:^|[;&|(]\s*)killall\b', '\bpkill\s+-9\b',
+  # destructive git (data / remote loss) — remove any you want codex to run freely
+  '\bgit\s+push\b[^|;&]*(--force|-f)\b',
+  '\bgit\s+reset\s+--hard\b',
+  '\bgit\s+clean\s+-[a-zA-Z]*f',
+  # overwrite system config
+  '>\s*/etc/',
+]
+
+# Allowlist (used only when approve_all = false). Kept so flipping back works.
+safe_patterns = [
+  '^\s*perl\b',
+  '^\s*nl\b',
+  '^\s*javap\b',
+  # jar: list contents only (tf/tvf/--list) — read-only. NOT bare `jar`, which
+  # would also allow create (cf) / extract (xf) / update (uf) that write files.
+  '^\s*jar\s+(-?t|--list)',
+]

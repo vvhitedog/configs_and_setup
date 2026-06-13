@@ -156,7 +156,9 @@ build_step_total() {
   [[ "$SKIP_ATUIN" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
   [[ "$SKIP_BLESH" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
   STEP_TOTAL=$((STEP_TOTAL + 1))
-  [[ "$SKIP_TMUX_COMPOSE" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
+  if [[ "$SKIP_TMUX_COMPOSE" -ne 1 ]]; then
+    STEP_TOTAL=$((STEP_TOTAL + 2))
+  fi
   STEP_TOTAL=$((STEP_TOTAL + 2))
   [[ "$SKIP_ATUIN" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
   if [[ "$SKIP_NEOVIM" -ne 1 ]]; then
@@ -718,7 +720,7 @@ install_base() {
     return 0
   fi
   apt_install curl git ripgrep fzf xsel unzip fontconfig python3 python3-dev python3-venv build-essential ca-certificates
-  apt_install_optional btop xclip wl-clipboard imagemagick
+  apt_install_optional btop xclip wl-clipboard imagemagick python3-tomli
 }
 
 install_vim_plug() {
@@ -940,6 +942,10 @@ sync_tmux() {
   copy_file "$SCRIPT_DIR/setup_tmux/tmux.conf" "$HOME/.tmux.conf" "tmux config"
 }
 
+sync_auto_approve() {
+  copy_dir "$SCRIPT_DIR/setup_auto_approve" "$HOME/.config/auto-approve" "auto-approve config"
+}
+
 reload_tmux_config() {
   if [[ -z "${TMUX:-}" ]]; then
     return 0
@@ -961,6 +967,7 @@ sync_tmux_compose() {
   local bin_src_dir="$SCRIPT_DIR/setup_tmux/bin"
   local unit_src_dir="$SCRIPT_DIR/setup_tmux/systemd/user"
   local src dest unit
+  local copied_bins=0 copied_units=0
 
   if [[ ! -d "$bin_src_dir" ]]; then
     echo "tmux-compose helper directory not found: $bin_src_dir"
@@ -979,6 +986,7 @@ sync_tmux_compose() {
     dest="$HOME/.local/bin/$(basename "$src")"
     copy_file_unprompted "$src" "$dest"
     chmod +x "$dest" || true
+    copied_bins=$((copied_bins + 1))
   done
 
   if [[ -d "$unit_src_dir" ]]; then
@@ -986,8 +994,11 @@ sync_tmux_compose() {
     for unit in "$unit_src_dir"/*; do
       [[ -f "$unit" ]] || continue
       copy_file_unprompted "$unit" "$HOME/.config/systemd/user/$(basename "$unit")"
+      copied_units=$((copied_units + 1))
     done
   fi
+
+  echo "    copied $copied_bins helper scripts and $copied_units user units"
 
   if [[ "$ENABLE_SYSTEMD" -ne 1 ]]; then
     return 0
@@ -997,7 +1008,7 @@ sync_tmux_compose() {
     return 0
   fi
   if [[ "$MODE" != "yolo" && "$OVERWRITE" -ne 1 ]]; then
-    if ! prompt_yes_no "Enable/start tmux-compose user services and snapshot timer?" "y"; then
+    if ! prompt_yes_no "Enable/start tmux-compose and auto-approve user services/timers?" "y"; then
       return 0
     fi
   fi
@@ -1006,8 +1017,15 @@ sync_tmux_compose() {
     echo "WARNING: systemctl --user daemon-reload failed; user services were not enabled."
     return 0
   fi
-  if ! run_logged "enable tmux-compose user services" systemctl --user enable --now tmux-pane-history.service tmux-window-usage.service tmux-compose-snapshot.timer; then
-    echo "WARNING: failed to enable/start one or more tmux-compose user units."
+  if ! run_logged "enable tmux-compose and auto-approve user services" \
+      systemctl --user enable --now \
+      tmux-pane-history.service \
+      tmux-window-usage.service \
+      tmux-compose-snapshot.timer \
+      claude-auto-approve.service \
+      cursor-auto-approve.service \
+      codex-auto-approve.service; then
+    echo "WARNING: failed to enable/start one or more tmux-compose or auto-approve user units."
   fi
 }
 
@@ -1202,6 +1220,7 @@ if [[ "$SKIP_BLESH" -ne 1 ]]; then
 fi
 run_step "Sync tmux config" sync_tmux
 if [[ "$SKIP_TMUX_COMPOSE" -ne 1 ]]; then
+  run_step "Sync auto-approve config" sync_auto_approve
   run_step "Sync tmux-compose helpers and services" sync_tmux_compose
 fi
 run_step "Reload running tmux config" reload_tmux_config

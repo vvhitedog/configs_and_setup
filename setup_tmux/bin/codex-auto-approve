@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""Auto-approve safe Codex CLI permission prompts in tmux panes."""
+
+import os
+import shlex
+import subprocess
+import time
+import re
+import sys
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+from pathlib import Path
+
+
+def _config_dir():
+    xdg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(xdg) / "auto-approve"
+
+
+def _load_toml(path, *, required):
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        if required:
+            print(f"codex-auto-approve: config not found at {path}", file=sys.stderr)
+            sys.exit(1)
+        return {}
+    except tomllib.TOMLDecodeError as e:
+        print(f"codex-auto-approve: invalid TOML in {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def load_config():
+    """Merge common.toml (shared) + codex.toml (daemon-specific extras)."""
+    common_path = _config_dir() / "common.toml"
+    own_path = _config_dir() / "codex.toml"
+
+    common = _load_toml(common_path, required=False)
+    own = _load_toml(own_path, required=True)
+
+    if "codex_processes" not in own:
+        print(f"codex-auto-approve: {own_path} missing required key `codex_processes`", file=sys.stderr)
+        sys.exit(1)
+
+    safe_patterns = list(common.get("safe_patterns", [])) + list(own.get("safe_patterns", []))
+    deny_patterns = list(common.get("deny_patterns", [])) + list(own.get("deny_patterns", []))
+    poll = float(own.get("poll_interval", common.get("poll_interval", 1.0)))
+    auto_approve_edits = bool(own.get("auto_approve_edits", True))
+    approve_all = bool(own.get("approve_all", common.get("approve_all", False)))
+
+    return {
+        "safe_patterns": safe_patterns,
+        "deny_patterns": deny_patterns,
+        "approve_all": approve_all,
+        "codex_processes": own["codex_processes"],
+        "poll_interval": poll,
+        "auto_approve_edits": auto_approve_edits,
+        "common_path": common_path if common else None,
+        "own_path": own_path,
+    }
+
+
+CONFIG = load_config()
+SAFE_PATTERNS = CONFIG["safe_patterns"]
+DENY_PATTERNS = CONFIG["deny_patterns"]
+APPROVE_ALL = CONFIG["approve_all"]
+CODEX_PROCESSES = set(CONFIG["codex_processes"])
+POLL_INTERVAL = CONFIG["poll_interval"]
+AUTO_APPROVE_EDITS = CONFIG["auto_approve_edits"]
+CONFIG_PATH = CONFIG["own_path"]
+COMMON_PATH = CONFIG["common_path"]
+
+
+def get_codex_panes():
+    """Get tmux pane IDs where Codex is the foreground process."""
+    try:
+        out = subprocess.check_output(
+            ["tmux", "list-panes", "-a", "-F",
+             "#{pane_id}\t#{pane_current_command}\t#{pane_mode}"],
+            text=True,
+        )
+        panes = []
+        for line in out.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.split("\t")
+            pane_id = parts[0]
+            fg_cmd = parts[1] if len(parts) > 1 else ""
+            mode = parts[2] if len(parts) > 2 else ""
+            if not mode and fg_cmd in CODEX_PROCESSES:
+                panes.append(pane_id)
+        return panes
+    except subprocess.CalledProcessError:
+        return []
+
+
+def capture_pane(pane_id, n=500):
+    """Capture scrollback — safe because we only target Codex panes."""
+    try:
+        out = subprocess.check_output(
+            ["tmux", "capture-pane", "-t", pane_id, "-p", "-J", "-S", "-500"],
+            text=True,
+        )
+        all_lines = out.rstrip("\n").split("\n")
+        return all_lines[-n:] if len(all_lines) > n else all_lines
+    except subprocess.CalledProcessError:
+        return []
+
+
+def send_keys(pane_id, keys):
+    subprocess.run(["tmux", "send-keys", "-t", pane_id, keys])
+
+
+def pane_cwd(pane_id):
+    """Current working directory of the pane's foreground process (codex), used
+    to decide whether an `rm` stays inside the workdir. "" if unavailable."""
+    try:
+        out = subprocess.run(
+            ["tmux", "display-message", "-t", pane_id, "-p", "#{pane_current_path}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            return out.stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return ""
+
+
+# Leading environment-variable assignments: FOO=bar BAZ=/tmp/x.sh <command...>
+_ENV_PREFIX_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*=\S*\s+)+")
+# Single/double-quoted regions — blanked before deny-matching so a dangerous
+# word or operator inside a grep pattern / string literal (e.g. the "shutdown"
+# in `rg "register.*shutdown"`) isn't mistaken for the command itself.
+_QUOTED_RE = re.compile(r"\"[^\"]*\"|'[^']*'")
+# `rm` as a command word — at start, after a shell operator, after whitespace,
+# or via a path (/bin/rm). Critically NOT a flag like docker's `--rm` (the `\b`
+# in a naive `\brm\b` treats the leading `-` as a boundary and false-matches).
+_HAS_RM_RE = re.compile(r"(?:^|[;&|(/]|\s)rm(?:\s|$)")
+# Container commands run the inner command INSIDE the container, not the host
+# shell, so the host-cwd rm gate doesn't apply: docker/compose exec always;
+# docker/compose run only when not bind-mounting a host path (a mount could let
+# an in-container rm reach the host).
+_DOCKER_EXEC_RE = re.compile(r"^\s*docker\s+(compose\s+)?exec\b")
+_DOCKER_RUN_RE = re.compile(r"^\s*docker\s+(compose\s+)?run\b")
+_DOCKER_MOUNT_RE = re.compile(r"\s(-v\b|--volume\b|--mount\b)")
+
+
+def _container_scoped(cmd):
+    """True if the command runs entirely inside a container, so host-cwd rm
+    analysis doesn't apply. exec/compose-exec always; run/compose-run only when
+    there's no host bind mount."""
+    if _DOCKER_EXEC_RE.match(cmd):
+        return True
+    if _DOCKER_RUN_RE.match(cmd) and not _DOCKER_MOUNT_RE.search(cmd):
+        return True
+    return False
+
+
+def all_segments_docker(scan):
+    """True if EVERY top-level command segment is a `docker` invocation (after
+    stripping env-var assignments). `scan` must be the quote-blanked command so
+    that operators inside quoted args (e.g. the `;` in `bash -lc '...; ...'`)
+    don't create spurious segments. Used to fully trust docker-only command
+    lines regardless of the deny list — per user request, since all build/test
+    work runs in containers. A glued-on non-docker segment (`docker x; rm -rf /`)
+    makes this False, so it falls through to the normal checks."""
+    segs = [s.strip() for s in re.split(r"\|\||&&|[;|&]", scan) if s.strip()]
+    if not segs:
+        return False
+    for s in segs:
+        s = re.sub(r"^([A-Za-z_][A-Za-z0-9_]*=\S*\s+)+", "", s)  # strip env prefix
+        if not re.match(r"(?:\S+/)?docker\b", s):
+            return False
+    return True
+
+# Besides the pane's working directory, rm targets under these roots are also
+# allowed — scratch space codex churns through. Add more here if needed.
+RM_EXTRA_ROOTS = ["/tmp"]
+
+
+def rm_confined_to_cwd(command, cwd):
+    """True only if EVERY `rm` invocation deletes paths confined to cwd or an
+    allowed extra root (/tmp). Tracks `cd` so `cd build && rm -f x` resolves x
+    against build — but only follows a `cd` to a path that stays inside the
+    allowed roots; a cd to home / `$VAR` / `cd -` / anywhere outside makes the
+    cwd 'unknown' and any later relative rm is refused. Command substitution or
+    unparseable quoting -> refused (conservative)."""
+    if "$(" in command or "`" in command:
+        return False
+    roots = [os.path.normpath(r) for r in ([cwd] + RM_EXTRA_ROOTS) if r]
+
+    def within(p):
+        return any(p == r or p.startswith(r + os.sep) for r in roots)
+
+    eff = os.path.normpath(cwd) if cwd else None  # effective cwd; None = unknown
+    for seg in re.split(r"\|\||&&|[;|&]", command):
+        try:
+            toks = shlex.split(seg)
+        except ValueError:
+            return False
+        k = 0  # skip leading env-var assignments
+        while k < len(toks) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[k]):
+            k += 1
+        if k >= len(toks):
+            continue
+        prog = os.path.basename(toks[k])
+        if prog == "cd":
+            arg = toks[k + 1] if k + 1 < len(toks) else None
+            if not arg or arg[0] in "~$-":
+                eff = None                        # home / var / `cd -` -> unknown
+            elif os.path.isabs(arg):
+                eff = os.path.normpath(arg)
+            elif eff is not None:
+                eff = os.path.normpath(os.path.join(eff, arg))
+            continue
+        if prog != "rm":
+            continue
+        targets = [t for t in toks[k + 1:] if not t.startswith("-")]
+        if not targets:
+            return False
+        for t in targets:
+            if not t or t[0] in "~$":
+                return False
+            if os.path.isabs(t):
+                p = os.path.normpath(t)
+            elif eff is not None:
+                p = os.path.normpath(os.path.join(eff, t))
+            else:
+                return False  # relative target but cwd is unknown
+            if not within(p):
+                return False
+    return True
+
+
+def is_safe(command, cwd=None):
+    cmd = command.strip()
+
+    # Approve-all mode: auto-approve ANY command UNLESS it matches a deny
+    # pattern. The denylist is matched UNANCHORED (re.search) so a dangerous
+    # command is caught even buried in a pipe/compound (`foo && rm -rf /`).
+    # A false match just makes that one command prompt — the safe direction.
+    if APPROVE_ALL:
+        # Match deny patterns against the command with quoted regions blanked,
+        # so a dangerous word/operator that's only part of a grep pattern or
+        # string literal isn't read as the command (real commands are unquoted).
+        scan = _QUOTED_RE.sub(" ", cmd)
+        # Docker-only command lines are fully trusted (deny list + rm gate
+        # bypassed): all build/test work runs in containers.
+        if all_segments_docker(scan):
+            return True
+        for pattern in DENY_PATTERNS:
+            if re.search(pattern, scan):
+                return False
+        # `rm` is allowed only when every target stays inside the pane's working
+        # dir or /tmp. Container-scoped commands (docker exec / mount-less run)
+        # operate in the container, not the host shell, so the host-cwd rm check
+        # doesn't apply to them.
+        if not _container_scoped(cmd):
+            if _HAS_RM_RE.search(scan) and not rm_confined_to_cwd(cmd, cwd):
+                return False
+        return True
+
+    # Allowlist mode: approve only commands matching a safe pattern. Also test
+    # with leading env-var assignments stripped, so a prefix like
+    # `GIT_SEQUENCE_EDITOR=... git rebase ...` or `PYTHONPATH=src python3 ...`
+    # still matches a pattern anchored on the program name. The assignments only
+    # set env; they don't change which program runs (PATH/LD_* aside).
+    candidates = [cmd]
+    stripped = _ENV_PREFIX_RE.sub("", cmd)
+    if stripped != cmd:
+        candidates.append(stripped)
+    for pattern in SAFE_PATTERNS:
+        for c in candidates:
+            if re.search(pattern, c):
+                return True
+    return False
+
+
+def find_active_prompt(lines):
+    """Locate a prompt that is ACTIVELY awaiting input; return (kind, header_idx)
+    or None.
+
+    The reliable signal is *bottom-anchoring*: a live prompt's option block is
+    the last thing on screen. The moment it's answered, Codex renders output
+    below it, pushing the options up — so a stale, already-answered prompt still
+    sitting in the scrollback (its `› 1. Yes, proceed (y)` and header intact) is
+    correctly rejected. This is what stops spurious `y` keystrokes into a pane
+    with no live prompt.
+
+    Order of checks (cheap → specific):
+      1. Find the "No, and tell Codex ..." option near the bottom. It is the
+         *last* option, so on an active prompt it sits at the bottom (only a
+         "Press enter to confirm" hint / border may follow). Its number varies
+         — 2 in a plain yes/no prompt, 3 when a "don't ask again" option is
+         present — so match its text, not the digit.
+      2. Find option 1 ("› 1. Yes, proceed (y)") above it — an intermediate
+         option can wrap many rows when it echoes a long command, so search
+         generously upward.
+      3. The nearest header above the live option block classifies the prompt;
+         a stale header higher in the scrollback is never reached first.
+    """
+    # True bottom of rendered content (ignore trailing blank lines).
+    end = len(lines)
+    while end > 0 and not lines[end - 1].strip():
+        end -= 1
+    if end == 0:
+        return None
+
+    # 1. The "No, and tell Codex ..." option must be pinned to the bottom (only
+    #    a hint / border may follow). Lots of content after it => already
+    #    answered. Match its text so it works for 2- and 3-option layouts alike.
+    no_idx = -1
+    for i in range(end - 1, max(end - 8, -1), -1):
+        if re.search(r"\b\d+\.\s+No,\s+and\s+tell\s+Codex", lines[i]):
+            no_idx = i
+            break
+    if no_idx < 0 or (end - 1 - no_idx) > 4:
+        return None
+
+    # 2. Option 1 (the selected "(y)" affordance) sits above the No option.
+    opt1 = -1
+    for i in range(no_idx - 1, max(no_idx - 100, -1), -1):
+        if re.search(r"›\s+1\.\s+Yes,\s+proceed\s+\(y\)", lines[i]):
+            opt1 = i
+            break
+    if opt1 < 0:
+        return None
+
+    # 3. Header just above the live option block.
+    for i in range(opt1, max(opt1 - 200, -1), -1):
+        if "Would you like to run the following command?" in lines[i]:
+            return "command", i
+        if "Would you like to make the following edits?" in lines[i]:
+            return "edits", i
+    return None
+
+
+def extract_prompt_command(lines, header_idx):
+    """Extract the full command from a Codex command prompt.
+
+    `tmux capture-pane -J` should join soft-wrapped terminal rows, but keep a
+    continuation fallback so emitted hard wraps between `$ <cmd>` and option 1
+    do not leave us checking only the first fragment.
+    """
+    pieces = []
+    collecting = False
+    for j in range(header_idx + 1, min(header_idx + 120, len(lines))):
+        line = lines[j]
+        if re.search(r"^\s*›?\s*1\.\s+Yes,\s+proceed", line):
+            break
+        if not collecting:
+            m = re.match(r"\s*\$\s+(.+?)\s*$", line)
+            if not m:
+                continue
+            pieces.append(m.group(1).strip())
+            collecting = True
+            continue
+        if not line.strip():
+            break
+        if re.match(r"\s*(Reason:|Would you like to (run|make))\b", line):
+            break
+        pieces.append(line.strip())
+
+    return " ".join(pieces).strip() if pieces else None
+
+
+def _handle_command_prompt(pane_id, lines, header_idx, last_approved, now):
+    """Codex 'run the following command' prompt — approve only if the command
+    matches the safe-command allowlist.
+
+        Would you like to run the following command?
+          Reason: <reason>
+          $ <cmd>
+        › 1. Yes, proceed (y)
+          ...
+    """
+    command = extract_prompt_command(lines, header_idx)
+
+    if not command or not is_safe(command, pane_cwd(pane_id)):
+        return False
+
+    print(f"  CODEX-AUTO-APPROVE [{pane_id}] cmd: {command[:120]}", flush=True)
+    send_keys(pane_id, "y")
+    last_approved[pane_id] = now
+    return True
+
+
+def _handle_edits_prompt(pane_id, last_approved, now):
+    """Codex 'make the following edits' prompt.
+
+    The prompt's textual body doesn't reliably surface file paths in a
+    parseable form, so by user policy we approve unconditionally when
+    `auto_approve_edits` is true. Disable via codex.toml if it misbehaves.
+    """
+    if not AUTO_APPROVE_EDITS:
+        return False
+    print(f"  CODEX-AUTO-APPROVE [{pane_id}] edits (auto)", flush=True)
+    send_keys(pane_id, "y")
+    last_approved[pane_id] = now
+    return True
+
+
+def check_pane(pane_id, last_approved):
+    """Detect a Codex permission prompt that is actively awaiting input and
+    auto-approve it. Command prompts are checked against the safe-command
+    allowlist; edit prompts approve per `auto_approve_edits`. Keypress is `y`.
+    """
+    now = time.time()
+    if now - last_approved.get(pane_id, 0) < 2.0:
+        return False
+
+    lines = capture_pane(pane_id)
+    if not lines:
+        return False
+
+    prompt = find_active_prompt(lines)
+    if not prompt:
+        return False
+    kind, header_idx = prompt
+
+    if kind == "command":
+        return _handle_command_prompt(pane_id, lines, header_idx, last_approved, now)
+    return _handle_edits_prompt(pane_id, last_approved, now)
+
+
+def main():
+    print("codex-auto-approve: watching tmux panes...")
+    if COMMON_PATH:
+        print(f"  common: {COMMON_PATH}")
+    print(f"  config: {CONFIG_PATH}")
+    print(f"  poll interval: {POLL_INTERVAL}s")
+    if APPROVE_ALL:
+        print(f"  MODE: approve-all (deny patterns: {len(DENY_PATTERNS)})")
+    else:
+        print(f"  MODE: allowlist (safe patterns: {len(SAFE_PATTERNS)})")
+    print(f"  codex processes: {CODEX_PROCESSES}")
+    print(f"  auto_approve_edits: {AUTO_APPROVE_EDITS}")
+    print("  press Ctrl-C to stop")
+    print()
+
+    last_approved = {}
+
+    while True:
+        try:
+            panes = get_codex_panes()
+            for pane_id in panes:
+                check_pane(pane_id, last_approved)
+            time.sleep(POLL_INTERVAL)
+        except KeyboardInterrupt:
+            print("\nstopped.")
+            sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

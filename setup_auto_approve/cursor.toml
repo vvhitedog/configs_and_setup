@@ -1,0 +1,16 @@
+# cursor-auto-approve configuration
+#
+# Read once at daemon startup. To apply changes:
+#   systemctl --user restart cursor-auto-approve
+#
+# Shared safe-command patterns live in `common.toml`. Anything you put in
+# `safe_patterns` here is appended to the common list (cursor-only extras).
+
+# Override common's poll interval if you want it different for cursor.
+# poll_interval = 1.0
+
+# Foreground process names that identify a Cursor agent pane.
+cursor_processes = ["agent", "cursor"]
+
+# Cursor-specific extras (most patterns live in common.toml).
+safe_patterns = []

@@ -1,0 +1,11 @@
+[Unit]
+Description=Auto-approve safe Codex CLI permission prompts
+After=default.target
+
+[Service]
+ExecStart=%h/.local/bin/codex-auto-approve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

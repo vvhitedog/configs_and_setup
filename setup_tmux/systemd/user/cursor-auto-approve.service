@@ -1,0 +1,12 @@
+[Unit]
+Description=Auto-approve safe Cursor agent permission prompts
+After=default.target
+
+[Service]
+ExecStart=%h/.local/bin/cursor-auto-approve
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target

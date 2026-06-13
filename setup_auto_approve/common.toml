@@ -1,0 +1,95 @@
+# Shared auto-approve configuration
+#
+# Read by ALL three daemons:
+#   - claude-auto-approve
+#   - cursor-auto-approve
+#   - codex-auto-approve
+#
+# Each daemon also reads its own TOML (claude.toml / cursor.toml / codex.toml)
+# for daemon-specific fields and any extra patterns. The final allowlist a
+# daemon uses is `common.safe_patterns + <daemon>.safe_patterns`.
+#
+# Restart all three to apply changes:
+#   systemctl --user restart claude-auto-approve cursor-auto-approve codex-auto-approve
+
+# Default poll interval (seconds). Each daemon may override in its own TOML.
+poll_interval = 1.0
+
+# Shared safe-command regex allowlist.
+# Use TOML literal strings (single quotes) so backslashes aren't doubled.
+safe_patterns = [
+  # --- read-only filesystem inspection ---
+  '^\s*grep\b',
+  '^\s*find\b',
+  '^\s*wc\b',
+  '^\s*ls\b',
+  '^\s*cat\b',
+  '^\s*head\b',
+  '^\s*tail\b',
+  '^\s*file\b',
+  '^\s*stat\b',
+  '^\s*du\b',
+  '^\s*df\b',
+  '^\s*which\b',
+  '^\s*readlink\b',
+  '^\s*diff\b',
+  '^\s*tree\b',
+  '^\s*pwd\b',
+  '^\s*cwd\b',
+  '^\s*rg\b',
+  '^\s*fd\b',
+
+  # --- process / system info ---
+  '^\s*env\b',
+  '^\s*printenv\b',
+  '^\s*whoami\b',
+  '^\s*uname\b',
+  '^\s*systemctl\s+(status|is-active|is-enabled|list-units|list-unit-files)\b',
+
+  # --- shell utilities ---
+  '^\s*sed\b',
+  '^\s*awk\b',
+  '^\s*cd\b',
+  '^\s*echo\b',
+  '^\s*sleep\b',
+  '^\s*timeout\b',
+  '^\s*for\b',
+
+  # --- ssh-add (caches local keys) ---
+  '^\s*ssh-add\b',
+
+  # --- docker (allows ssh-add and DOCKER_HOST= prefixes) ---
+  # Includes container lifecycle/control verbs (create/kill/rm/pause/...), which
+  # codex gates as "container and cluster control". Container-scoped, not host.
+  '^\s*(ssh-add\s+\S+.*;\s*)?(DOCKER_HOST=\S+\s+)?docker\s+(exec|run|inspect|ps|images|logs|stats|top|port|cp|diff|create|start|stop|restart|kill|pause|unpause|rm|rename|update|wait|pull|build|info|version|volume|network)\b',
+  '^\s*(ssh-add\s+\S+.*;\s*)?(DOCKER_HOST=\S+\s+)?docker\s+compose\s+(exec|run|ps|logs|images|top|up|down|restart|start|stop|kill|build|pull)\b',
+  '^\s*(ssh-add\s+\S+.*;\s*)?(DOCKER_HOST=\S+\s+)?docker-compose\s+(exec|run|ps|logs|images|top|up|down|restart|start|stop|kill|build|pull)\b',
+
+  # --- git (permissive: any subcommand) ---
+  '^\s*git\b',
+
+  # --- build / dev tools ---
+  '^\s*cmake\b',
+  '^\s*make\b',
+  '^\s*sh\s+build',
+  # python, including venv/abs paths and leading env-var assignments:
+  # python, python3, python3.12, .venv/bin/python -u ..., /usr/bin/python3,
+  # PYTHONPATH=src python3 ..., FOO=bar BAZ=qux python ...
+  '^\s*([A-Za-z_][A-Za-z0-9_]*=\S*\s+)*(\S*/)?python3?\b',
+  '^\s*pip\s+(list|show|freeze)\b',
+  '^\s*npm\s+(list|ls|outdated|info)\b',
+  '^\s*cargo\s+(build|check|test|clippy)\b',
+  '^\s*clang-format\s+--version\b',
+  '^\s*clang-format\s+(-i\s+|--dry-run)',
+  '^\s*codex\b',
+
+  # --- gh CLI: read-only + interactive helpers (browse, pr checkout) ---
+  '^\s*gh\s+(pr|issue)\s+(view|list|diff|checks|status|checkout)\b',
+  '^\s*gh\s+(repo|gist|ruleset)\s+(view|list)\b',
+  '^\s*gh\s+(release|workflow|org)\s+(view|list)\b',
+  '^\s*gh\s+run\s+(view|list|watch)\b',
+  '^\s*gh\s+search\b',
+  '^\s*gh\s+auth\s+status\b',
+  '^\s*gh\s+label\s+list\b',
+  '^\s*gh\s+browse\b',
+]

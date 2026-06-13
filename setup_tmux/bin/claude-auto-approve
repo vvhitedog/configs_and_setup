@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""Auto-approve safe Claude Code permission prompts in tmux panes."""
+
+import os
+import subprocess
+import time
+import re
+import sys
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+from pathlib import Path
+
+
+def _config_dir():
+    xdg = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(xdg) / "auto-approve"
+
+
+def _load_toml(path, *, required):
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        if required:
+            print(f"claude-auto-approve: config not found at {path}", file=sys.stderr)
+            sys.exit(1)
+        return {}
+    except tomllib.TOMLDecodeError as e:
+        print(f"claude-auto-approve: invalid TOML in {path}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def load_config():
+    """Merge common.toml (shared) + claude.toml (daemon-specific extras)."""
+    common_path = _config_dir() / "common.toml"
+    own_path = _config_dir() / "claude.toml"
+
+    common = _load_toml(common_path, required=False)
+    own = _load_toml(own_path, required=True)
+
+    if "safe_tools" not in own:
+        print(f"claude-auto-approve: {own_path} missing required key `safe_tools`", file=sys.stderr)
+        sys.exit(1)
+
+    # Merge bash patterns: common.safe_patterns + own's extras (under either
+    # `safe_patterns` or the legacy `safe_bash_patterns` field).
+    common_patterns = list(common.get("safe_patterns", []))
+    own_extras = list(own.get("safe_patterns", [])) + list(own.get("safe_bash_patterns", []))
+    safe_bash_patterns = common_patterns + own_extras
+
+    poll = float(own.get("poll_interval", common.get("poll_interval", 1.0)))
+
+    return {
+        "safe_bash_patterns": safe_bash_patterns,
+        "safe_tools": own["safe_tools"],
+        "poll_interval": poll,
+        "common_path": common_path if common else None,
+        "own_path": own_path,
+    }
+
+
+CONFIG = load_config()
+SAFE_BASH_PATTERNS = CONFIG["safe_bash_patterns"]
+SAFE_TOOLS = CONFIG["safe_tools"]
+POLL_INTERVAL = CONFIG["poll_interval"]
+CONFIG_PATH = CONFIG["own_path"]
+COMMON_PATH = CONFIG["common_path"]
+
+
+def get_active_pane():
+    """Get the currently focused pane ID."""
+    try:
+        out = subprocess.check_output(
+            ["tmux", "display-message", "-p", "#{pane_id}"],
+            text=True,
+        )
+        return out.strip()
+    except subprocess.CalledProcessError:
+        return None
+
+
+def get_panes():
+    """Get all tmux pane IDs, excluding panes in a mode (choose-tree, copy-mode, etc.)."""
+    try:
+        out = subprocess.check_output(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_id}\t#{pane_mode}"],
+            text=True,
+        )
+        panes = []
+        for line in out.strip().split("\n"):
+            if not line:
+                continue
+            parts = line.split("\t", 1)
+            pane_id = parts[0]
+            mode = parts[1] if len(parts) > 1 else ""
+            if not mode:
+                panes.append(pane_id)
+        return panes
+    except subprocess.CalledProcessError:
+        return []
+
+
+def capture_pane(pane_id, n=500):
+    """Capture the bottom N lines of a tmux pane, including scrollback."""
+    try:
+        out = subprocess.check_output(
+            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-500"],
+            text=True,
+        )
+        all_lines = out.rstrip("\n").split("\n")
+        return all_lines[-n:] if len(all_lines) > n else all_lines
+    except subprocess.CalledProcessError:
+        return []
+
+
+def send_keys(pane_id, keys):
+    """Send keys to a tmux pane."""
+    subprocess.run(["tmux", "send-keys", "-t", pane_id, keys])
+
+
+def is_safe_bash(command):
+    """Check if a bash command matches our safe patterns."""
+    cmd = command.strip()
+    for pattern in SAFE_BASH_PATTERNS:
+        if re.search(pattern, cmd):
+            return True
+    return False
+
+
+def check_pane(pane_id):
+    """Check a pane for a Claude permission prompt and auto-approve if safe.
+
+    Claude Code permission prompt format:
+        <ToolName> [details]
+
+           <command or args>
+           <description>
+
+         Permission rule ...
+
+         Do you want to proceed?
+         ❯ 1. Yes
+           2. No
+    """
+    lines = capture_pane(pane_id)
+    text = "\n".join(lines)
+
+    # The active permission prompt must be near the bottom of the pane.
+    # Check only the last 15 lines to avoid matching scrollback history.
+    bottom = lines[-15:]
+    bottom_text = "\n".join(bottom)
+
+    if not re.search(r"Do you want to (proceed|allow)", bottom_text):
+        return False
+
+    if not re.search(r"❯\s+1\.\s+Yes", bottom_text):
+        return False
+
+    # Anchor on the LAST "Do you want to ..." line — that's the active prompt.
+    # (Older prompts had a "Permission rule" line; newer ones don't, so we use
+    # the question line itself, which is universal.)
+    permission_idx = None
+    for i, line in enumerate(lines):
+        if re.search(r"Do you want to (proceed|allow)", line):
+            permission_idx = i
+    # no break — keep going to find the last one
+
+    if permission_idx is None:
+        return False
+
+    # Search backward from permission line to find the prompt box.
+    # Stop at the decorative ─── line that marks the top of the prompt box.
+    prompt_top = 0
+    for i in range(permission_idx - 1, -1, -1):
+        if "─" * 10 in lines[i]:
+            prompt_top = i + 1
+            break
+
+    # Within the prompt box, find the tool header or command
+    for i in range(permission_idx - 1, prompt_top - 1, -1):
+        stripped = lines[i].strip()
+        if not stripped:
+            continue
+
+        # Check for safe tool header. Tool name may appear as:
+        #   "Read"               (exact)
+        #   "Edit file.txt"      (followed by space + arg)
+        #   "Web Search(\"q\")"  (followed by paren — newer prompt format)
+        for safe_tool in SAFE_TOOLS:
+            tool_pat = r"^" + re.escape(safe_tool) + r"(?:[\s(]|$)"
+            if re.match(tool_pat, stripped):
+                print(f"  AUTO-APPROVE [{pane_id}] {safe_tool}: {stripped}")
+                send_keys(pane_id, "Enter")
+                return True
+
+        # Found "Bash command" header — command is the next non-empty line after it
+        if stripped == "Bash command":
+            for j in range(i + 1, permission_idx):
+                candidate = lines[j].strip()
+                if candidate:
+                    if is_safe_bash(candidate):
+                        print(f"  AUTO-APPROVE [{pane_id}] Bash: {candidate}")
+                        send_keys(pane_id, "Enter")
+                        return True
+                    else:
+                        return False
+            return False
+
+        # Check if this line matches a safe bash pattern (header may be off-screen)
+        if is_safe_bash(stripped):
+            print(f"  AUTO-APPROVE [{pane_id}] Bash(backward): {stripped}")
+            send_keys(pane_id, "Enter")
+            return True
+
+    return False
+
+
+def main():
+    print("claude-auto-approve: watching tmux panes...")
+    if COMMON_PATH:
+        print(f"  common: {COMMON_PATH}")
+    print(f"  config: {CONFIG_PATH}")
+    print(f"  poll interval: {POLL_INTERVAL}s")
+    print(f"  safe bash patterns: {len(SAFE_BASH_PATTERNS)}")
+    print(f"  safe tools: {len(SAFE_TOOLS)}")
+    print("  press Ctrl-C to stop")
+    print()
+
+    while True:
+        try:
+            panes = get_panes()
+            for pane_id in panes:
+                check_pane(pane_id)
+            time.sleep(POLL_INTERVAL)
+        except KeyboardInterrupt:
+            print("\nstopped.")
+            sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
