@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -62,6 +62,33 @@ COMPLETED_STEPS=()
 COPIED_ITEMS=0
 UPTODATE_ITEMS=0
 DECLINED_ITEMS=0
+LAST_ERROR=""
+LAST_LOG=""
+
+report_error() {
+  LAST_ERROR="$*"
+  echo "ERROR: $*"
+}
+
+note_unhandled_error() {
+  local rc=$?
+  if [[ "$rc" -ne 0 && -z "$LAST_ERROR" ]]; then
+    if [[ -n "$CURRENT_STEP" ]]; then
+      LAST_ERROR="$CURRENT_STEP failed with exit $rc"
+    else
+      LAST_ERROR="setup failed with exit $rc"
+    fi
+  fi
+  return "$rc"
+}
+
+print_log_tail() {
+  local log="$1"
+  if [[ -s "$log" ]]; then
+    echo "      last log lines:"
+    tail -n 20 "$log" | sed 's/^/        /'
+  fi
+}
 
 ensure_log_dir() {
   if [[ -z "$LOG_DIR" ]]; then
@@ -80,15 +107,21 @@ log_file_for() {
 run_logged() {
   local label="$1"
   shift
-  local log
+  local log rc
   log="$(log_file_for "$label")"
   printf '    %s\n' "$label"
-  if "$@" >"$log" 2>&1; then
+  set +e
+  "$@" >"$log" 2>&1
+  rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
     printf '      ok\n'
     return 0
   fi
-  local rc=$?
+  LAST_ERROR="$label failed with exit $rc"
+  LAST_LOG="$log"
   printf '      failed (exit %s). Log: %s\n' "$rc" "$log"
+  print_log_tail "$log"
   return "$rc"
 }
 
@@ -136,6 +169,8 @@ run_step() {
   shift
   STEP_INDEX=$((STEP_INDEX + 1))
   CURRENT_STEP="$label"
+  LAST_ERROR=""
+  LAST_LOG=""
   local remaining=$((STEP_TOTAL - STEP_INDEX))
   printf '\n[%02d/%02d] %s (%d left)\n' "$STEP_INDEX" "$STEP_TOTAL" "$label" "$remaining"
   "$@"
@@ -161,6 +196,12 @@ print_final_summary() {
   echo "Completed steps: ${#COMPLETED_STEPS[@]}/${STEP_TOTAL}"
   if [[ "$rc" -ne 0 && -n "$CURRENT_STEP" ]]; then
     echo "Failed step: [$STEP_INDEX/$STEP_TOTAL] $CURRENT_STEP"
+  fi
+  if [[ "$rc" -ne 0 && -n "$LAST_ERROR" ]]; then
+    echo "Error: $LAST_ERROR"
+  fi
+  if [[ "$rc" -ne 0 && -n "$LAST_LOG" ]]; then
+    echo "Error log: $LAST_LOG"
   fi
   echo "Config copies: $COPIED_ITEMS updated, $UPTODATE_ITEMS already current, $DECLINED_ITEMS skipped by choice"
   echo "Elapsed: ${elapsed}s"
@@ -342,11 +383,11 @@ copy_file_unprompted() {
   dest_dir="$(dirname "$dest")"
 
   if ! mkdir -p "$dest_dir" 2>/dev/null; then
-    echo "ERROR: failed to create destination directory: $dest_dir"
+    report_error "failed to create destination directory: $dest_dir"
     return 1
   fi
   if ! cp -a "$src" "$dest" 2>/dev/null; then
-    echo "ERROR: failed to copy $src to $dest"
+    report_error "failed to copy $src to $dest"
     return 1
   fi
 }
@@ -428,11 +469,11 @@ copy_dir() {
   local dest_dir
   dest_dir="$(dirname "$dest")"
   if ! mkdir -p "$dest_dir" 2>/dev/null; then
-    echo "ERROR: failed to create destination directory: $dest_dir"
+    report_error "failed to create destination directory: $dest_dir"
     return 1
   fi
   if ! cp -a "$src" "$dest" 2>/dev/null; then
-    echo "ERROR: failed to copy $src to $dest"
+    report_error "failed to copy $src to $dest"
     return 1
   fi
   COPIED_ITEMS=$((COPIED_ITEMS + 1))
@@ -1113,6 +1154,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 build_step_total
+trap note_unhandled_error ERR
 trap print_final_summary EXIT
 print_summary
 
