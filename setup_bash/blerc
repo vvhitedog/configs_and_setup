@@ -8,7 +8,7 @@ bleopt complete_menu_maxlines=15
 
 # === Color scheme — matches tmux muted dark palette ===
 # Palette (Nord-adjacent, matching tmux #2f3440 bg / #c8ced6 fg / cyan accent):
-#   blue:   #81a1c1   cyan:    #88c0d0   teal:   #8fbcbb
+#   blue:   #6f8fb3   cyan:    #88c0d0   teal:   #8fbcbb
 #   green:  #a3be8c   yellow:  #ebcb8b   orange: #d08770
 #   red:    #bf616a   purple:  #b48ead   dim:    #636c7c
 #   fg:     #d8dee9   bright:  #eceff4
@@ -18,14 +18,14 @@ ble-face auto_complete='fg=#636c7c,italic'
 
 # Syntax
 ble-face syntax_default='fg=#d8dee9'
-ble-face syntax_command='fg=#81a1c1'
+ble-face syntax_command='fg=#6f8fb3'
 ble-face syntax_quoted='fg=#a3be8c'
 ble-face syntax_quotation='fg=#a3be8c'
 ble-face syntax_escape='fg=#d08770'
 ble-face syntax_expr='fg=#ebcb8b'
 ble-face syntax_error='fg=#bf616a,bold'
 ble-face syntax_varname='fg=#b48ead'
-ble-face syntax_delimiter='fg=#81a1c1'
+ble-face syntax_delimiter='fg=#6f8fb3'
 ble-face syntax_param_expansion='fg=#b48ead'
 ble-face syntax_history_expansion='fg=#ebcb8b'
 ble-face syntax_function_name='fg=#88c0d0,bold'
@@ -42,16 +42,16 @@ ble-face command_builtin='fg=#88c0d0'
 ble-face command_alias='fg=#8fbcbb'
 ble-face command_function='fg=#8fbcbb'
 ble-face command_file='fg=#d8dee9'
-ble-face command_keyword='fg=#81a1c1,bold'
+ble-face command_keyword='fg=#6f8fb3,bold'
 ble-face command_jobs='fg=#ebcb8b'
-ble-face command_directory='fg=#81a1c1,bold'
+ble-face command_directory='fg=#6f8fb3,bold'
 ble-face command_suffix='fg=#a3be8c'
 ble-face command_suffix_new='fg=#a3be8c,bold'
 ble-face argument_option='fg=#d8dee9'
 ble-face argument_error='fg=#bf616a'
 
 # Filenames
-ble-face filename_directory='fg=#81a1c1,bold'
+ble-face filename_directory='fg=#6f8fb3,bold'
 ble-face filename_link='fg=#88c0d0'
 ble-face filename_orphan='fg=#bf616a,italic'
 ble-face filename_setuid='fg=#d08770,bold'

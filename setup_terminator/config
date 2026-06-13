@@ -15,7 +15,7 @@
     font = SauceCodePro Nerd Font 14
     foreground_color = "#abb2bf"
     show_titlebar = False
-    palette = "#1e2127:#e06c75:#98c379:#e5c07b:#61afef:#c678dd:#56b6c2:#abb2bf:#5c6370:#e06c75:#98c379:#e5c07b:#61afef:#c678dd:#56b6c2:#ffffff"
+    palette = "#1e2127:#e06c75:#98c379:#e5c07b:#6f8fb3:#c678dd:#56b6c2:#abb2bf:#5c6370:#e06c75:#98c379:#e5c07b:#6f8fb3:#c678dd:#56b6c2:#ffffff"
     use_system_font = False
     title_transmit_fg_color = "#20232a"
     title_transmit_bg_color = "#7a9c61"
