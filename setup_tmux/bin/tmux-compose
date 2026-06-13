@@ -1,0 +1,2247 @@
+#!/usr/bin/env python3
+"""Tmux terminal toolkit — persistent tmux-compose session with history, compose, terminals, status, help."""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import sqlite3
+import tempfile
+from datetime import datetime
+
+DB_PATH = os.path.expanduser("~/.cache/tmux/pane-history.db")
+STATE_DIR = os.path.expanduser("~/.cache/tmux/compose-state")
+COMPOSE_SESSION = "tmux-compose"
+
+# --- Session recovery -----------------------------------------------------
+# A crash (e.g. OOM during a compile) kills the tmux server and every session
+# with it. We periodically snapshot the *layout* — session names, window order,
+# window names, and each window's workdir — to a single JSON file so it can be
+# rebuilt with `tmux-compose resume`. Deliberately minimal: no scrollback, no
+# running commands, no pane splits — apps checkpoint their own state.
+RECOVERY_DIR = os.path.expanduser("~/.cache/tmux/recovery")
+RECOVERY_FILE = os.path.join(RECOVERY_DIR, "sessions.json")
+RECOVERY_BAK = os.path.join(RECOVERY_DIR, "sessions.json.bak")
+RECOVERY_VERSION = 1
+_VT100_CTRL_RE = re.compile(r"[\x0e\x0f]")
+TODO_PATH = os.path.expanduser("~/todo/todo.md")
+TODO_REPO = os.path.expanduser("~/todo")
+
+SERVICES = [
+    "tmux-pane-history",
+    "tmux-window-usage",
+    "claude-auto-approve",
+    "cursor-auto-approve",
+    "codex-auto-approve",
+]
+
+# --- Settings -----------------------------------------------------------
+# Whether `create-window` / `create-split` should pop a `command-prompt`
+# asking for a window name after creating. Toggled from the status screen.
+PROMPT_ON_CREATE_FILE = os.path.join(STATE_DIR, "prompt_on_create")
+
+
+def get_prompt_on_create():
+    try:
+        with open(PROMPT_ON_CREATE_FILE) as f:
+            return f.read().strip().lower() in ("on", "1", "true", "yes")
+    except FileNotFoundError:
+        return False
+
+
+def set_prompt_on_create(val):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(PROMPT_ON_CREATE_FILE, "w") as f:
+        f.write("on" if val else "off")
+
+
+def cmd_create_window(cwd):
+    """Bound to `prefix C`: new window inheriting cwd, optional name prompt."""
+    cwd = cwd or os.path.expanduser("~")
+    subprocess.run(["tmux", "new-window", "-c", cwd])
+    if get_prompt_on_create():
+        subprocess.run(["tmux", "command-prompt",
+                        "-p", "name:", "rename-window '%%'"])
+
+
+def cmd_create_split(cwd):
+    """Bound to `prefix o`: vertical split inheriting cwd. No rename prompt."""
+    cwd = cwd or os.path.expanduser("~")
+    subprocess.run(["tmux", "split-window", "-v", "-c", cwd])
+
+
+FORK_HELP = """Fork the current agent context into a new tmux window.
+
+Usage:
+  tmux-compose fork local [OPTIONS]
+  tmux-compose fork worktree [OPTIONS]
+  tmux-compose fork --help
+
+Modes:
+  local
+      Same-directory fork. Creates a new tmux window in --cwd, starts a forked
+      agent in pane 0, opens a shell in pane 1, and focuses pane 0. This is
+      what prefix+k uses. No git state is changed.
+
+  worktree
+      Git worktree fork. Requires --cwd to be inside a git worktree. Creates a
+      new branch and physical worktree, then opens the same two-pane tmux window
+      rooted in that worktree. If --branch is omitted, a unique branch named
+      fork/<slug>-<timestamp> is created. If --path is omitted, the worktree is
+      created as a sibling of the current repo root.
+
+Common options:
+  --cwd DIR             Source directory. Defaults to the current tmux pane path
+                        when run inside tmux, otherwise the process cwd.
+  -n, --name NAME       New tmux window name and Codex thread-title seed.
+                        Blank/omitted uses a generated name based on the mode
+                        and cwd.
+  --agent AGENT         Agent to launch: codex or claude. Default: codex.
+  --prompt TEXT         Optional initial prompt passed to the forked agent.
+  --session-id ID       Codex only: fork this exact session id instead of
+                        auto-detecting the newest session for --cwd.
+
+Worktree-only options:
+  --branch BRANCH       New git branch name to create for the worktree. Fails
+                        if the branch already exists.
+  --path DIR            Physical worktree directory. Defaults to a sibling of
+                        the current repository root.
+  --base REF            Base ref for git worktree add -b. Default: HEAD.
+
+Agent behavior:
+  codex   Uses native Codex forking. tmux-compose seeds the terminal
+          title with the fork window name before launching Codex so the saved
+          thread is named for that fork. By default it reads Codex session metadata,
+          finds the newest recorded session whose cwd matches --cwd, and runs
+          codex fork <SESSION_ID> -C <target-dir>. If no matching session is
+          found, it falls back to codex fork --all --last -C <target-dir> so
+          the target directory does not filter out the origin transcript.
+
+  claude  Best-effort fallback: claude --continue --fork-session, launched in
+          the target directory. Claude does not expose the same cwd-filtered
+          native fork semantics as Codex here.
+
+Examples:
+  # Same-dir fork from an agent/script:
+  tmux-compose fork local --cwd "$PWD" --name scratch-fork
+
+  # Worktree fork with an automatic branch/path:
+  tmux-compose fork worktree --cwd "$PWD" --name parser-experiment
+
+  # Worktree fork with an explicit branch for a user request:
+  tmux-compose fork worktree --cwd "$PWD" --name fix-window-tests \\
+    --branch user/fix-window-tests --prompt "Investigate the failing window tests"
+"""
+
+
+def _fail(msg, code=1):
+    print(f"tmux-compose fork: {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def _run_capture(cmd, *, cwd=None, timeout=30, check=True):
+    try:
+        r = subprocess.run(
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        _fail(f"command not found: {cmd[0]}")
+    except subprocess.TimeoutExpired:
+        _fail(f"command timed out: {shlex.join(cmd)}")
+    if check and r.returncode != 0:
+        detail = (r.stderr or r.stdout or "").strip()
+        _fail(f"command failed: {shlex.join(cmd)}" + (f"\n{detail}" if detail else ""))
+    return r
+
+
+def _tmux_current_path():
+    r = subprocess.run(
+        ["tmux", "display-message", "-p", "#{pane_current_path}"],
+        capture_output=True, text=True, timeout=5)
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    return None
+
+
+def _default_cwd(cwd):
+    if cwd:
+        return os.path.abspath(os.path.expanduser(cwd))
+    tmux_cwd = _tmux_current_path()
+    if tmux_cwd:
+        return os.path.abspath(os.path.expanduser(tmux_cwd))
+    return os.getcwd()
+
+
+def _slug(s):
+    s = (s or "fork").strip().lower()
+    s = re.sub(r"[^a-z0-9._/-]+", "-", s)
+    s = re.sub(r"-+", "-", s).strip("-/. ")
+    return s or "fork"
+
+
+def _path_slug(s):
+    return _slug(s).replace("/", "-")
+
+
+def _default_window_name(mode, cwd, name):
+    name = (name or "").strip()
+    if name:
+        return name
+    base = os.path.basename(os.path.abspath(cwd)) or "cwd"
+    return f"{mode}-{base}"
+
+
+
+CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
+
+
+def _latest_codex_session_id_for_cwd(cwd):
+    if not cwd:
+        return None
+    root = CODEX_SESSIONS_DIR
+    if not os.path.isdir(root):
+        return None
+
+    wanted = os.path.realpath(os.path.abspath(os.path.expanduser(cwd)))
+    best = None
+    for dirpath, _, filenames in os.walk(root):
+        for filename in filenames:
+            if not filename.endswith(".jsonl"):
+                continue
+            path = os.path.join(dirpath, filename)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    record = json.loads(f.readline())
+                if record.get("type") != "session_meta":
+                    continue
+                payload = record.get("payload") or {}
+                session_cwd = payload.get("cwd")
+                session_id = payload.get("id")
+                if not session_cwd or not session_id:
+                    continue
+                session_cwd = os.path.realpath(
+                    os.path.abspath(os.path.expanduser(session_cwd)))
+                if session_cwd != wanted:
+                    continue
+                score = (os.path.getmtime(path), payload.get("timestamp") or "")
+                if best is None or score > best[0]:
+                    best = (score, session_id)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                continue
+    return best[1] if best else None
+
+
+def _agent_command(agent, target_dir, session_id=None, prompt=None, window_name=None):
+    if agent == "codex":
+        if not shutil.which("codex"):
+            _fail("codex not found on PATH")
+        cmd = ["codex", "fork"]
+        if session_id:
+            cmd.append(session_id)
+        else:
+            # Fallback when Codex metadata cannot identify the source cwd.
+            cmd.extend(["--all", "--last"])
+        cmd.extend(["-C", target_dir])
+        if prompt:
+            cmd.append(prompt)
+        return cmd
+    if agent == "claude":
+        if not shutil.which("claude"):
+            _fail("claude not found on PATH")
+        cmd = ["claude", "--continue", "--fork-session"]
+        if window_name:
+            cmd.extend(["--name", window_name])
+        if prompt:
+            cmd.append(prompt)
+        return cmd
+    _fail(f"unsupported agent: {agent}")
+
+
+def _agent_shell_command(window_name, agent_cmd):
+    safe_title = window_name.replace("\033", "").replace("\007", "")
+    return f"printf '\033]0;%s\007' {shlex.quote(safe_title)}; exec {shlex.join(agent_cmd)}"
+
+
+def _launch_fork_window(window_name, target_dir, agent_cmd, quiet=False):
+    if not shutil.which("tmux"):
+        _fail("tmux not found on PATH")
+    if not os.path.isdir(target_dir):
+        _fail(f"target directory does not exist: {target_dir}")
+
+    r = _run_capture([
+        "tmux", "new-window",
+        "-n", window_name,
+        "-c", target_dir,
+        "-P", "-F", "#{window_id}\t#{pane_id}",
+        _agent_shell_command(window_name, agent_cmd),
+    ])
+    parts = r.stdout.strip().split("\t")
+    if len(parts) != 2:
+        _fail("tmux did not return new window/pane ids")
+    window_id, agent_pane = parts
+
+    subprocess.run(["tmux", "set-window-option", "-t", window_id,
+                    "automatic-rename", "off"], capture_output=True)
+    subprocess.run(["tmux", "select-pane", "-t", agent_pane, "-T", "agent"],
+                   capture_output=True)
+
+    r = _run_capture([
+        "tmux", "split-window", "-v",
+        "-c", target_dir,
+        "-t", agent_pane,
+        "-P", "-F", "#{pane_id}",
+    ])
+    shell_pane = r.stdout.strip()
+    if shell_pane:
+        subprocess.run(["tmux", "select-pane", "-t", shell_pane, "-T", "shell"],
+                       capture_output=True)
+
+    subprocess.run(["tmux", "select-window", "-t", window_id], capture_output=True)
+    subprocess.run(["tmux", "select-pane", "-t", agent_pane], capture_output=True)
+    if not quiet:
+        print(f"created {window_name}: agent pane {agent_pane}, shell pane {shell_pane}, cwd {target_dir}")
+
+
+def _git_root(cwd):
+    r = subprocess.run(
+        ["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    return os.path.abspath(r.stdout.strip())
+
+
+def _branch_exists(root, branch):
+    r = subprocess.run(
+        ["git", "-C", root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+        capture_output=True)
+    return r.returncode == 0
+
+
+def _validate_branch(root, branch):
+    r = subprocess.run(
+        ["git", "-C", root, "check-ref-format", "--branch", branch],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "invalid branch name").strip()
+        _fail(f"invalid branch name {branch!r}: {detail}")
+
+
+def _prepare_worktree(cwd, name, branch, worktree_dir, base_ref):
+    root = _git_root(cwd)
+    if not root:
+        _fail(f"worktree mode requires --cwd inside a git repository: {cwd}")
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    branch_slug = _slug(branch) if branch else f"fork/{_slug(name)}-{timestamp}"
+    _validate_branch(root, branch_slug)
+    if _branch_exists(root, branch_slug):
+        _fail(f"branch already exists: {branch_slug}")
+
+    path_slug = _path_slug(branch_slug)
+    wt_dir = os.path.abspath(os.path.expanduser(worktree_dir)) if worktree_dir else \
+        os.path.join(os.path.dirname(root), f"{os.path.basename(root)}-{path_slug}")
+    if os.path.exists(wt_dir):
+        _fail(f"worktree path already exists: {wt_dir}")
+    os.makedirs(os.path.dirname(wt_dir), exist_ok=True)
+
+    _run_capture(["git", "-C", root, "worktree", "add", "-b", branch_slug, wt_dir, base_ref], timeout=120)
+
+    rel = os.path.relpath(cwd, root)
+    target_dir = wt_dir if rel == "." else os.path.join(wt_dir, rel)
+    if not os.path.isdir(target_dir):
+        target_dir = wt_dir
+    return wt_dir, target_dir, branch_slug
+
+
+def _fork_parser():
+    parser = argparse.ArgumentParser(
+        prog="tmux-compose fork",
+        description="Fork the current Codex/Claude context into a new tmux window.",
+        epilog=FORK_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("mode", nargs="?", choices=("local", "worktree"), default="local")
+    parser.add_argument("--cwd", help="source directory; defaults to current tmux pane path")
+    parser.add_argument("-n", "--name", help="new tmux window name")
+    parser.add_argument("--agent", choices=("codex", "claude"), default="codex")
+    parser.add_argument("--prompt", help="optional initial prompt for the forked agent")
+    parser.add_argument("--session-id", help="Codex session id to fork instead of auto-detection")
+    parser.add_argument("--branch", help="worktree mode: branch name to create")
+    parser.add_argument("--path", dest="worktree_dir", help="worktree mode: physical worktree directory")
+    parser.add_argument("--base", default="HEAD", help="worktree mode: base ref for git worktree add -b")
+    parser.add_argument("--quiet", action="store_true", help="suppress status output; used by tmux keybindings")
+    return parser
+
+
+def cmd_fork(args):
+    if args and args[0] in ("-h", "--help"):
+        print(FORK_HELP)
+        return
+    ns = _fork_parser().parse_args(args)
+    cwd = _default_cwd(ns.cwd)
+    if not os.path.isdir(cwd):
+        _fail(f"cwd does not exist: {cwd}")
+
+    window_name = _default_window_name(ns.mode, cwd, ns.name)
+    target_dir = cwd
+    if ns.mode == "worktree":
+        wt_dir, target_dir, branch = _prepare_worktree(
+            cwd, window_name, ns.branch, ns.worktree_dir, ns.base)
+        if not ns.quiet:
+            print(f"created worktree {wt_dir} on branch {branch}")
+
+    session_id = ns.session_id
+    if ns.agent == "codex" and not session_id:
+        session_id = _latest_codex_session_id_for_cwd(cwd)
+
+    agent_cmd = _agent_command(
+        ns.agent, target_dir, session_id=session_id,
+        prompt=ns.prompt, window_name=window_name)
+    _launch_fork_window(window_name, target_dir, agent_cmd, quiet=ns.quiet)
+
+
+def cmd_fork_prompt(args):
+    mode = args[0] if args else "local"
+    cwd = args[1] if len(args) > 1 else _default_cwd(None)
+    if mode not in ("local", "worktree"):
+        _fail("fork-prompt mode must be local or worktree")
+    script = os.path.abspath(shutil.which(sys.argv[0]) or sys.argv[0])
+    prompt = "fork window name:"
+    fork_cmd = (
+        f"{shlex.quote(script)} fork {mode} --cwd {shlex.quote(cwd)} "
+        "--name '%1' --agent codex --quiet")
+    if mode == "worktree":
+        prompt = "fork window name:,branch name:"
+        fork_cmd += " --branch '%2'"
+    command = "run-shell " + shlex.quote(fork_cmd)
+    subprocess.run(["tmux", "command-prompt", "-p", prompt, command])
+
+
+def cmd_toggle_prompt_on_create():
+    new_val = not get_prompt_on_create()
+    set_prompt_on_create(new_val)
+    print("on" if new_val else "off")
+
+
+# --- codex auto_approve_edits toggle ------------------------------------
+# Lives in codex.toml (read by codex-auto-approve daemon) so a single
+# source of truth. Hand-edits the line so toml comments are preserved.
+CODEX_TOML_PATH = os.path.expanduser("~/.config/auto-approve/codex.toml")
+_CODEX_EDITS_RE = re.compile(
+    r"^(\s*auto_approve_edits\s*=\s*)(true|false)\b", re.MULTILINE)
+
+
+def get_codex_auto_edits():
+    try:
+        with open(CODEX_TOML_PATH) as f:
+            content = f.read()
+    except FileNotFoundError:
+        return False
+    m = _CODEX_EDITS_RE.search(content)
+    return bool(m) and m.group(2) == "true"
+
+
+def cmd_toggle_codex_auto_edits():
+    """Flip auto_approve_edits in codex.toml and restart the daemon."""
+    try:
+        with open(CODEX_TOML_PATH) as f:
+            content = f.read()
+    except FileNotFoundError:
+        print("off")
+        return
+    m = _CODEX_EDITS_RE.search(content)
+    if not m:
+        print("off")
+        return
+    new_val = "false" if m.group(2) == "true" else "true"
+    new_content = content[:m.start(2)] + new_val + content[m.end(2):]
+    with open(CODEX_TOML_PATH, "w") as f:
+        f.write(new_content)
+    subprocess.run(
+        ["systemctl", "--user", "restart", "codex-auto-approve.service"],
+        capture_output=True,
+    )
+    print("on" if new_val == "true" else "off")
+
+
+# --- codex approve_all toggle -------------------------------------------
+# Flips between allowlist mode (approve only safe_patterns) and approve-all
+# mode (approve everything except deny_patterns). Same single-source-of-truth
+# hand-edit approach as the auto_approve_edits toggle above.
+_CODEX_APPROVE_ALL_RE = re.compile(
+    r"^(\s*approve_all\s*=\s*)(true|false)\b", re.MULTILINE)
+
+
+def get_codex_approve_all():
+    try:
+        with open(CODEX_TOML_PATH) as f:
+            content = f.read()
+    except FileNotFoundError:
+        return False
+    m = _CODEX_APPROVE_ALL_RE.search(content)
+    return bool(m) and m.group(2) == "true"
+
+
+def cmd_toggle_codex_approve_all():
+    """Flip approve_all in codex.toml and restart the daemon."""
+    try:
+        with open(CODEX_TOML_PATH) as f:
+            content = f.read()
+    except FileNotFoundError:
+        print("off")
+        return
+    m = _CODEX_APPROVE_ALL_RE.search(content)
+    if not m:
+        print("off")
+        return
+    new_val = "false" if m.group(2) == "true" else "true"
+    new_content = content[:m.start(2)] + new_val + content[m.end(2):]
+    with open(CODEX_TOML_PATH, "w") as f:
+        f.write(new_content)
+    subprocess.run(
+        ["systemctl", "--user", "restart", "codex-auto-approve.service"],
+        capture_output=True,
+    )
+    print("on" if new_val == "true" else "off")
+
+HELP_TEXT = r"""
+  tmux-compose — terminal toolkit
+  ================================
+
+  TMUX KEYBINDINGS
+  -----------------
+  prefix+h  History    View current pane's scrollback (ANSI colors)
+  prefix+e  Compose    Write text to send to pane or clipboard
+  prefix+t  Terminals  Browse all saved terminal histories
+  prefix+S  Status     View/control background daemons
+  prefix+T  Todo       Manage todo items (synced to ~/todo/todo.md)
+  prefix+b  Btop       System resource monitor; prefix+b again jumps back (btop stays running)
+  prefix+r  Back       Jump to previous pane (jumplist)
+  prefix+f  Forward    Jump to next pane (jumplist)
+  prefix+j  Jumplist   Pick from recent pane visits
+  prefix+k  Fork       Fork current agent context in a new local window
+  prefix+K  Worktree   Fork current agent context into a new git worktree
+
+  WINDOW KEYBINDINGS (inside tmux-compose)
+  --------------------------------------
+  qh        Switch to history window
+  qe        Switch to compose window
+  qt        Switch to terminals window
+  qS        Switch to status window
+  ?         Switch to help window
+  qq        Jump back to previous session (where you came from)
+
+  COMPOSE KEYS
+  -------------
+  qa        Send compose text to source pane + jump back
+  qw        Copy compose text to clipboard + jump back
+  :w/:wq    Disabled — use qa or qw
+
+  TERMINALS KEYS
+  ---------------
+  Enter     View selected terminal's full history
+  /         Search all terminals (regex)
+  n         Edit note for selected terminal
+  qq        Jump back
+
+  STATUS KEYS
+  ------------
+  r         Restart service on current line
+  s         Start service on current line
+  R         Refresh all statuses
+  qq        Jump back
+
+  TODO KEYS
+  ----------
+  a         Add new todo item
+  d         Toggle status (TODO → IN-PROGRESS → DONE)
+  e         Edit item in ~/todo/todo.md (opens real file)
+  Enter     Focus detail pane for scrolling
+  R         Refresh from file
+  qq        Jump back
+
+  JUMPLIST
+  ---------
+  The jumplist tracks every pane you visit. Use prefix+r to go back
+  and prefix+f to go forward, like browser history. Dead panes are
+  skipped automatically.
+
+  prefix+j opens a picker showing recent pane visits — select one
+  to jump directly there.
+
+  FORK
+  -----
+  prefix+k prompts for a window name and opens a same-directory Codex fork in
+  a new tmux window. prefix+K prompts for a window name and branch name,
+  creates a git worktree fork, and opens the same two-pane Codex layout there.
+  The new window has pane 0 running the forked agent and pane 1 as a shell.
+  Focus stays on pane 0.
+
+  Agents/scripts can use the CLI form:
+    tmux-compose fork --help
+    tmux-compose fork local --cwd DIR --name NAME
+    tmux-compose fork worktree --cwd DIR --name NAME [--branch BRANCH]
+
+  DATA STORAGE
+  -------------
+  Database: ~/.cache/tmux/pane-history.db (SQLite, WAL mode)
+  State:    ~/.cache/tmux/compose-state/
+
+  Tables:
+    captures       Individual pane scrollback snapshots
+    merged         Deduplicated merged history per pane lifecycle
+    compositions   Saved compose outputs
+    terminal_notes User memos attached to terminals
+    jumplist       Pane visit history for navigation
+
+  RESET
+  ------
+  Run: tmux-compose reset
+  This kills the tmux-compose session and wipes state. Next prefix+h
+  recreates everything fresh.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
+
+def strip_vt100_controls(text):
+    return _VT100_CTRL_RE.sub("", text)
+
+
+def ensure_tables():
+    if not os.path.exists(os.path.dirname(DB_PATH)):
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS compositions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pane_id TEXT, content TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS terminal_notes (
+            pane_id TEXT PRIMARY KEY, note TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def save_composition(label, content):
+    if not content.strip():
+        return
+    ensure_tables()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        "INSERT INTO compositions (pane_id, content, created_at) VALUES (?, ?, ?)",
+        (label, content, datetime.now().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_recent_compositions(n=20):
+    ensure_tables()
+    if not os.path.exists(DB_PATH):
+        return []
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    rows = conn.execute(
+        "SELECT content, created_at, pane_id FROM compositions ORDER BY id DESC LIMIT ?",
+        (n,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def get_terminal_histories():
+    if not os.path.exists(DB_PATH):
+        return []
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    rows = conn.execute("""
+        SELECT m.pane_id, length(m.content),
+               (SELECT max(c.captured_at) FROM captures c WHERE c.pane_id = m.pane_id),
+               m.label
+        FROM merged m
+        WHERE m.label NOT LIKE 'tmux-compose:%'
+        ORDER BY (SELECT max(c.captured_at) FROM captures c WHERE c.pane_id = m.pane_id) DESC
+    """).fetchall()
+    conn.close()
+    return rows
+
+
+def get_merged_history(pane_id):
+    if not os.path.exists(DB_PATH):
+        return ""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    row = conn.execute(
+        "SELECT content FROM merged WHERE pane_id = ?", (pane_id,)
+    ).fetchone()
+    if not row and "@" in pane_id:
+        bare = pane_id.split("@")[0]
+        old = conn.execute(
+            "SELECT content FROM merged WHERE pane_id = ?", (bare,)
+        ).fetchone()
+        conn.close()
+        return old[0] if old else ""
+    conn.close()
+    return row[0] if row else ""
+
+
+def get_merged_history_tail(pane_id, max_lines=500):
+    content = get_merged_history(pane_id)
+    if not content:
+        return ""
+    lines = content.split("\n")
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    return strip_vt100_controls("\n".join(lines))
+
+
+def resolve_terminal_key(pane_id):
+    try:
+        out = subprocess.check_output(
+            ["tmux", "list-panes", "-a", "-F",
+             "#{pane_id}\t#{pane_pid}",
+             "-f", "#{==:#{pane_id}," + pane_id + "}"],
+            text=True,
+        ).strip()
+        parts = out.split("\t")
+        if len(parts) == 2 and parts[1]:
+            return f"{parts[0]}@{parts[1]}"
+    except subprocess.CalledProcessError:
+        pass
+    return pane_id
+
+
+def get_notes():
+    ensure_tables()
+    if not os.path.exists(DB_PATH):
+        return {}
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT pane_id, note FROM terminal_notes").fetchall()
+    conn.close()
+    return {r[0]: r[1] for r in rows}
+
+
+def set_note(pane_id, note):
+    ensure_tables()
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    if note.strip():
+        conn.execute(
+            "INSERT OR REPLACE INTO terminal_notes (pane_id, note) VALUES (?, ?)",
+            (pane_id, note),
+        )
+    else:
+        conn.execute("DELETE FROM terminal_notes WHERE pane_id = ?", (pane_id,))
+    conn.commit()
+    conn.close()
+
+
+def search_terminals(pattern):
+    if not os.path.exists(DB_PATH):
+        return {}
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    rows = conn.execute("SELECT pane_id, content FROM merged").fetchall()
+    conn.close()
+    results = {}
+    try:
+        rx = re.compile(pattern, re.IGNORECASE)
+    except re.error:
+        return {}
+    for pane_id, content in rows:
+        clean = re.sub(r"\033\[[0-9;]*[a-zA-Z]", "", content)
+        matches = rx.findall(clean)
+        if matches:
+            results[pane_id] = len(matches)
+    return results
+
+
+def get_pane_label(pane_id):
+    try:
+        return subprocess.check_output(
+            ["tmux", "display-message", "-t", pane_id, "-p",
+             "#{session_name}:#{window_index}.#{pane_index}"],
+            text=True,
+        ).strip()
+    except subprocess.CalledProcessError:
+        return pane_id
+
+
+# ---------------------------------------------------------------------------
+# Todo helpers
+# ---------------------------------------------------------------------------
+
+def parse_todo_items():
+    """Parse ~/todo/todo.md into a list of item dicts."""
+    if not os.path.exists(TODO_PATH):
+        return []
+    with open(TODO_PATH, "r") as f:
+        lines = f.readlines()
+    items = []
+    i = 0
+    header_re = re.compile(r"^##\s+\[(\w[\w-]*)\]\s+(.+?)\s*\{{3}\s*$")
+    while i < len(lines):
+        m = header_re.match(lines[i])
+        if m:
+            status = m.group(1)
+            title = m.group(2)
+            line_start = i + 1  # 1-indexed
+            # Collect body until matching closing }}}
+            depth = 1
+            body_lines = []
+            j = i + 1
+            while j < len(lines) and depth > 0:
+                if "{{{" in lines[j]:
+                    depth += 1
+                if "}}}" in lines[j]:
+                    depth -= 1
+                    if depth == 0:
+                        break
+                body_lines.append(lines[j])
+                j += 1
+            line_end = j + 1  # 1-indexed, inclusive of closing }}}
+            body = "".join(body_lines)
+            # Extract fields
+            synopsis = ""
+            due = ""
+            tags = ""
+            details_lines = []
+            in_details = False
+            details_depth = 0
+            for bl in body_lines:
+                stripped = bl.strip()
+                if stripped.startswith("**Synopsis:**"):
+                    synopsis = stripped.replace("**Synopsis:**", "").strip()
+                elif stripped.startswith("**Due:**"):
+                    due = stripped.replace("**Due:**", "").strip()
+                elif stripped.startswith("**Tags:**"):
+                    tags = stripped.replace("**Tags:**", "").strip()
+                elif stripped.startswith("**Details:**"):
+                    in_details = True
+                    details_depth = 1
+                elif in_details:
+                    if "{{{" in bl:
+                        details_depth += 1
+                    if "}}}" in bl:
+                        details_depth -= 1
+                        if details_depth <= 0:
+                            in_details = False
+                            continue
+                    details_lines.append(bl)
+            items.append({
+                "status": status,
+                "title": title,
+                "synopsis": synopsis,
+                "due": due,
+                "tags": tags,
+                "details": "".join(details_lines).strip(),
+                "body": body.strip(),
+                "line_start": line_start,
+                "line_end": line_end,
+            })
+            i = j + 1
+        else:
+            i += 1
+    return items
+
+
+def refresh_todo_data():
+    """Write todo.json and detail files to STATE_DIR."""
+    items = parse_todo_items()
+    details_dir = os.path.join(STATE_DIR, "todo_details")
+    if os.path.exists(details_dir):
+        shutil.rmtree(details_dir)
+    os.makedirs(details_dir, exist_ok=True)
+
+    # Group order for display
+    status_order = {"TODO": 0, "IN-PROGRESS": 1, "NOTE": 2, "DONE": 3}
+    items.sort(key=lambda x: status_order.get(x["status"], 99))
+
+    todo_data = []
+    for idx, item in enumerate(items):
+        detail_path = os.path.join(details_dir, f"item_{idx}.txt")
+        detail_text = (
+            f"[{item['status']}] {item['title']}\n"
+            f"{'=' * (len(item['title']) + len(item['status']) + 3)}\n\n"
+            f"Due:      {item['due']}\n"
+            f"Synopsis: {item['synopsis']}\n"
+            f"Tags:     {item['tags']}\n\n"
+            f"Details:\n{item['details']}\n"
+        )
+        with open(detail_path, "w") as f:
+            f.write(detail_text)
+        todo_data.append({
+            "status": item["status"],
+            "title": item["title"],
+            "synopsis": item["synopsis"],
+            "due": item["due"],
+            "tags": item["tags"],
+            "line_start": item["line_start"],
+            "line_end": item["line_end"],
+            "detail_path": detail_path,
+        })
+    with open(os.path.join(STATE_DIR, "todo.json"), "w") as f:
+        json.dump(todo_data, f)
+
+
+def git_commit_todo(message):
+    """Stage and commit todo.md."""
+    subprocess.run(["git", "-C", TODO_REPO, "add", "todo.md"], capture_output=True)
+    subprocess.run(["git", "-C", TODO_REPO, "commit", "-m", message], capture_output=True)
+
+
+def cmd_todo_add(args):
+    """Add a new todo item and commit."""
+    if not args:
+        return
+    title = " ".join(args)
+    new_item = "\n\n## [TODO] %s {{{\n\n" \
+               "**Due:** TBD\n" \
+               "**Synopsis:** %s\n\n\n" \
+               "**Details:**  {{{\n" \
+               "* \n" \
+               "}}}\n\n" \
+               "**Tags:** \n\n" \
+               "}}}\n" % (title, title)
+    with open(TODO_PATH, "r") as f:
+        content = f.read()
+    # Insert before the vim modeline
+    modeline_re = re.compile(r"\n(# vim:.*$)", re.MULTILINE)
+    m = modeline_re.search(content)
+    if m:
+        content = content[:m.start()] + new_item + "\n" + m.group(1) + "\n"
+    else:
+        content += new_item
+    with open(TODO_PATH, "w") as f:
+        f.write(content)
+    git_commit_todo(f"Add item - {title}")
+    print(json.dumps({"ok": True}))
+
+
+def cmd_todo_update_status(args):
+    """Update an item's status and commit. Args: line_start new_status."""
+    if len(args) < 2:
+        return
+    line_num = int(args[0])
+    new_status = args[1]
+    with open(TODO_PATH, "r") as f:
+        lines = f.readlines()
+    idx = line_num - 1
+    if idx < 0 or idx >= len(lines):
+        return
+    header_re = re.compile(r"^(##\s+)\[(\w[\w-]*)\](\s+.+)$")
+    m = header_re.match(lines[idx])
+    if not m:
+        return
+    old_status = m.group(2)
+    title_part = m.group(3).rstrip()
+    lines[idx] = f"{m.group(1)}[{new_status}]{title_part}\n"
+    with open(TODO_PATH, "w") as f:
+        f.writelines(lines)
+    # Extract title for commit message
+    title = title_part.replace("{{{", "").strip()
+    git_commit_todo(f"Update item ({old_status} -> {new_status}) - {title}")
+    print(json.dumps({"ok": True}))
+
+
+# ---------------------------------------------------------------------------
+# Subcommand handlers (called from lua via vim.fn.system)
+# ---------------------------------------------------------------------------
+
+def cmd_search(args):
+    print(json.dumps(search_terminals(args[0]) if args else {}))
+
+
+def cmd_note(args):
+    if len(args) < 1:
+        return
+    if len(args) > 1:
+        set_note(args[0], " ".join(args[1:]))
+    else:
+        notes = get_notes()
+        print(notes.get(args[0], ""))
+
+
+def cmd_dump(args):
+    if len(args) < 2:
+        return
+    content = get_merged_history(args[0])
+    with open(args[1], "w") as f:
+        f.write(strip_vt100_controls(content))
+
+
+def cmd_status(args):
+    results = []
+    for svc in SERVICES:
+        try:
+            out = subprocess.check_output(
+                ["systemctl", "--user", "show", svc + ".service",
+                 "--property=ActiveState,SubState,MainPID,ExecMainStartTimestamp"],
+                text=True,
+            )
+            props = {}
+            for line in out.strip().split("\n"):
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    props[k] = v
+            results.append({
+                "name": svc,
+                "state": props.get("ActiveState", "unknown"),
+                "pid": props.get("MainPID", "0"),
+                "started": props.get("ExecMainStartTimestamp", ""),
+            })
+        except subprocess.CalledProcessError:
+            results.append({"name": svc, "state": "unknown", "pid": "0", "started": ""})
+    print(json.dumps(results))
+
+
+# ---------------------------------------------------------------------------
+# Lua templates
+# ---------------------------------------------------------------------------
+
+COMMON_LUA = r"""
+state_dir = '<<STATE_DIR>>'
+script = '<<SCRIPT>>'
+
+function read_file(path)
+    local f = io.open(path, 'r')
+    if not f then return '' end
+    local content = f:read('*a'); f:close()
+    return content
+end
+
+function write_file(path, text)
+    local f = io.open(path, 'w')
+    if f then f:write(text); f:close() end
+end
+
+function get_source_pane()
+    return read_file(state_dir .. '/source_pane_id'):gsub('%s+$', '')
+end
+
+function get_source_label()
+    return read_file(state_dir .. '/source_label'):gsub('%s+$', '')
+end
+
+vim.keymap.set('n', 'qq', function()
+    vim.fn.system('tmux switch-client -l')
+end, { noremap = true })
+vim.keymap.set('n', 'q?', function()
+    vim.fn.system('tmux select-window -t tmux-compose:help')
+end, { noremap = true })
+
+function set_wo(win, opt, val)
+    local ok = pcall(vim.api.nvim_set_option_value, opt, val, { win = win })
+    if not ok then
+        pcall(vim.api.nvim_win_set_option, win, opt, val)
+    end
+end
+
+vim.opt.laststatus = 2
+vim.opt.shadafile = 'NONE'
+vim.opt.statusline = ' qq=back  q?=help'
+"""
+
+HISTORY_LUA = r"""
+dofile('<<STATE_DIR>>/common.lua')
+
+local hist_path = '<<STATE_DIR>>/history.txt'
+
+local function load_history()
+    local content = read_file(hist_path)
+    local lines = vim.split(content, '\n')
+    vim.bo.modifiable = true
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
+    local ok, baleia = pcall(require, 'baleia')
+    if ok then baleia.setup({async = false}).once(0) end
+    vim.bo.modifiable = false
+    vim.bo.buftype = 'nofile'
+    vim.cmd('normal G')
+    local label = get_source_label()
+    if label ~= '' then
+        pcall(vim.api.nvim_buf_set_name, 0, 'history [' .. label .. ']')
+    end
+end
+
+function reload_history()
+    load_history()
+end
+
+vim.wo.wrap = false
+vim.wo.foldenable = false
+vim.wo.number = false
+load_history()
+"""
+
+COMPOSE_LUA = r"""
+dofile('<<STATE_DIR>>/common.lua')
+
+local compose_path = '<<STATE_DIR>>/compose.txt'
+
+vim.wo.wrap = true
+vim.wo.foldenable = false
+vim.bo.buftype = 'nofile'
+pcall(vim.api.nvim_buf_set_name, 0, 'compose')
+
+local content = read_file(compose_path)
+if content ~= '' then
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, vim.split(content, '\n'))
+end
+
+local function save_compose()
+    local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
+    write_file(compose_path, table.concat(lines, '\n'))
+end
+
+vim.keymap.set('n', 'qa', function()
+    save_compose()
+    vim.fn.system(script .. ' send-compose')
+    vim.fn.system('tmux switch-client -l')
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, {''})
+    write_file(compose_path, '')
+end, { noremap = true })
+
+vim.keymap.set('n', 'qw', function()
+    save_compose()
+    vim.fn.system(script .. ' clip-compose')
+    vim.fn.system('tmux switch-client -l')
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, {''})
+    write_file(compose_path, '')
+end, { noremap = true })
+
+vim.api.nvim_create_autocmd('BufWriteCmd', {
+    buffer = 0,
+    callback = function()
+        vim.notify('Use qa=send to pane, qw=clipboard, qq=back', vim.log.levels.WARN)
+    end,
+})
+
+vim.wo.statusline = ' qa=send to pane  qw=clipboard  │  qq=back'
+"""
+
+TERMINALS_LUA = r"""
+dofile('<<STATE_DIR>>/common.lua')
+
+local terminals_json_path = '<<STATE_DIR>>/terminals.json'
+local search_counts = {}
+
+local f = io.open(terminals_json_path, 'r')
+if not f then
+    vim.notify('No terminal histories', vim.log.levels.WARN)
+    return
+end
+local raw = f:read('*a'); f:close()
+local items = vim.json.decode(raw)
+if not items or #items == 0 then
+    vim.notify('No terminal histories', vim.log.levels.WARN)
+    return
+end
+
+local preview_buf = vim.api.nvim_create_buf(false, true)
+vim.bo[preview_buf].buftype = 'nofile'
+vim.bo[preview_buf].modifiable = false
+
+local list_buf = vim.api.nvim_get_current_buf()
+vim.bo[list_buf].buftype = 'nofile'
+pcall(vim.api.nvim_buf_set_name, list_buf, 'terminals')
+
+local function refresh_list()
+    local lines = {}
+    for _, item in ipairs(items) do
+        local count_str = search_counts[item.pane] and (' [' .. search_counts[item.pane] .. ']') or ''
+        local note_str = (item.note and item.note ~= '') and (' | ' .. item.note:sub(1, 30)) or ''
+        local display = item.label or item.pane
+        table.insert(lines, string.format(' %s %s %dK%s%s',
+            item.date, display, item.size_kb or 0, count_str, note_str))
+    end
+    vim.bo[list_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(list_buf, 0, -1, false, lines)
+    vim.bo[list_buf].modifiable = false
+end
+refresh_list()
+
+-- list_buf is current buffer. Create preview split on right.
+local list_win = vim.api.nvim_get_current_win()
+vim.cmd('rightbelow vsplit')
+local preview_win = vim.api.nvim_get_current_win()
+vim.api.nvim_win_set_buf(preview_win, preview_buf)
+set_wo(preview_win, 'wrap', false)
+set_wo(preview_win, 'foldenable', false)
+set_wo(preview_win, 'number', false)
+set_wo(preview_win, 'statusline', ' preview')
+
+-- Focus list and make it narrow (30%), preview gets 70%
+vim.api.nvim_set_current_win(list_win)
+vim.cmd('vertical resize ' .. math.floor(vim.o.columns * 0.30))
+set_wo(list_win, 'number', false)
+set_wo(list_win, 'cursorline', true)
+set_wo(list_win, 'wrap', false)
+set_wo(list_win, 'foldenable', false)
+
+local function update_preview()
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    local item = items[row]
+    if not item then return end
+    local tf = io.open(item.tail_path, 'r')
+    if not tf then return end
+    local content = tf:read('*a'); tf:close()
+    vim.bo[preview_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(preview_buf, 0, -1, false, vim.split(content, '\n'))
+    local bok, bmod = pcall(require, 'baleia')
+    if bok then bmod.setup({async = false}).once(preview_buf) end
+    vim.bo[preview_buf].modifiable = false
+    pcall(vim.api.nvim_win_set_cursor, preview_win,
+        {vim.api.nvim_buf_line_count(preview_buf), 0})
+    set_wo(preview_win, 'statusline', (item.note and item.note ~= '')
+        and (' note: ' .. item.note) or ' preview')
+end
+vim.api.nvim_create_autocmd('CursorMoved', { buffer = list_buf, callback = update_preview })
+update_preview()
+
+vim.keymap.set('n', '<CR>', function()
+    local row = vim.api.nvim_win_get_cursor(0)[1]
+    local item = items[row]
+    if not item then return end
+    vim.fn.system(script .. ' refresh-history ' .. vim.fn.shellescape(item.pane))
+    vim.fn.system('tmux select-window -t tmux-compose:history')
+end, { buffer = list_buf, noremap = true })
+
+vim.keymap.set('n', '/', function()
+    vim.ui.input({ prompt = 'Search terminals: ' }, function(pattern)
+        if not pattern or pattern == '' then search_counts = {}; refresh_list(); return end
+        local out = vim.fn.system(script .. ' --search ' .. vim.fn.shellescape(pattern))
+        local ok2, counts = pcall(vim.json.decode, out)
+        search_counts = (ok2 and counts) or {}
+        refresh_list()
+        vim.notify(vim.tbl_count(search_counts) .. ' terminals matched', vim.log.levels.INFO)
+    end)
+end, { buffer = list_buf, noremap = true })
+
+vim.keymap.set('n', 'n', function()
+    local row = vim.api.nvim_win_get_cursor(0)[1]
+    local item = items[row]
+    if not item then return end
+    vim.ui.input({
+        prompt = 'Note for ' .. (item.label or item.pane) .. ': ',
+        default = item.note or '',
+    }, function(note)
+        if note == nil then return end
+        item.note = note
+        vim.fn.system(script .. ' --note ' .. vim.fn.shellescape(item.pane) .. ' ' .. vim.fn.shellescape(note))
+        refresh_list(); update_preview()
+    end)
+end, { buffer = list_buf, noremap = true })
+
+set_wo(list_win, 'statusline', ' Enter=view  /=search  n=note  │  qq=back')
+"""
+
+STATUS_LUA = r"""
+dofile('<<STATE_DIR>>/common.lua')
+
+local status_buf = vim.api.nvim_get_current_buf()
+vim.bo.buftype = 'nofile'
+pcall(vim.api.nvim_buf_set_name, status_buf, 'status')
+vim.wo.number = false; vim.wo.cursorline = true
+vim.wo.wrap = false; vim.wo.foldenable = false
+
+function refresh_status()
+    local out = vim.fn.system(script .. ' --status')
+    local ok, svcs = pcall(vim.json.decode, out)
+    if not ok then return end
+    local lines = {' Service Status', ' ──────────────────────────────────────────'}
+    for _, s in ipairs(svcs) do
+        local icon = s.state == 'active' and ' [running]' or ' [stopped]'
+        local pid_str = (s.pid ~= '0' and s.pid ~= '') and ('  pid=' .. s.pid) or ''
+        local started = s.started ~= '' and ('  since ' .. s.started) or ''
+        table.insert(lines, string.format(' %s%s%s%s', s.name, icon, pid_str, started))
+    end
+
+    -- Settings section (read live values from tmux-compose CLI)
+    local prompt_state = (vim.fn.system(script .. ' --get-prompt-on-create')):gsub('%s+', '')
+    local codex_edits  = (vim.fn.system(script .. ' --get-codex-auto-edits')):gsub('%s+', '')
+    local codex_appall = (vim.fn.system(script .. ' --get-codex-approve-all')):gsub('%s+', '')
+    table.insert(lines, '')
+    table.insert(lines, ' Settings')
+    table.insert(lines, ' ──────────────────────────────────────────')
+    table.insert(lines, ' prompt-on-create:  ' .. (prompt_state == 'on' and 'on ' or 'off')
+                                              .. '   (prompts for window name on prefix+C)')
+    table.insert(lines, ' codex auto-edits:  ' .. (codex_edits == 'on' and 'on ' or 'off')
+                                              .. '   (codex-auto-approve edits prompts)')
+    table.insert(lines, ' codex approve-all: ' .. (codex_appall == 'on' and 'on ' or 'off')
+                                              .. '   (auto-approve ALL cmds except denylist)')
+
+    table.insert(lines, '')
+    table.insert(lines, ' r=restart  s=start  p=prompt  e=edits  a=approve-all  R=refresh  qq=back')
+    vim.bo[status_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(status_buf, 0, -1, false, lines)
+    vim.bo[status_buf].modifiable = false
+end
+refresh_status()
+
+local function get_svc_name()
+    local line = vim.api.nvim_get_current_line()
+    for _, name in ipairs({'tmux-pane-history', 'tmux-window-usage', 'claude-auto-approve', 'cursor-auto-approve', 'codex-auto-approve'}) do
+        if line:find(name, 1, true) then return name end
+    end
+end
+
+vim.keymap.set('n', 'r', function()
+    local svc = get_svc_name()
+    if svc then
+        vim.fn.system('systemctl --user restart ' .. svc .. '.service')
+        vim.notify('Restarted ' .. svc, vim.log.levels.INFO)
+        vim.defer_fn(refresh_status, 500)
+    end
+end, { buffer = status_buf, noremap = true })
+
+vim.keymap.set('n', 's', function()
+    local svc = get_svc_name()
+    if svc then
+        vim.fn.system('systemctl --user start ' .. svc .. '.service')
+        vim.notify('Started ' .. svc, vim.log.levels.INFO)
+        vim.defer_fn(refresh_status, 500)
+    end
+end, { buffer = status_buf, noremap = true })
+
+vim.keymap.set('n', 'R', refresh_status, { buffer = status_buf, noremap = true })
+
+vim.keymap.set('n', 'p', function()
+    local new_state = (vim.fn.system(script .. ' --toggle-prompt-on-create')):gsub('%s+', '')
+    vim.notify('prompt-on-create: ' .. new_state, vim.log.levels.INFO)
+    refresh_status()
+end, { buffer = status_buf, noremap = true })
+
+vim.keymap.set('n', 'e', function()
+    local new_state = (vim.fn.system(script .. ' --toggle-codex-auto-edits')):gsub('%s+', '')
+    vim.notify('codex auto-edits: ' .. new_state .. ' (codex-auto-approve restarted)', vim.log.levels.INFO)
+    refresh_status()
+end, { buffer = status_buf, noremap = true })
+
+vim.keymap.set('n', 'a', function()
+    local new_state = (vim.fn.system(script .. ' --toggle-codex-approve-all')):gsub('%s+', '')
+    vim.notify('codex approve-all: ' .. new_state .. ' (codex-auto-approve restarted)', vim.log.levels.INFO)
+    refresh_status()
+end, { buffer = status_buf, noremap = true })
+
+vim.wo.statusline = ' r=restart  s=start  p=prompt  e=edits  a=approve-all  R=refresh  │  qq=back'
+"""
+
+HELP_LUA = r"""
+dofile('<<STATE_DIR>>/common.lua')
+
+vim.wo.wrap = false
+vim.wo.foldenable = false
+vim.wo.number = false
+vim.bo.modifiable = false
+vim.bo.buftype = 'nofile'
+pcall(vim.api.nvim_buf_set_name, 0, 'help')
+"""
+
+TODO_LUA = r"""
+dofile('<<STATE_DIR>>/common.lua')
+
+local todo_json_path = '<<STATE_DIR>>/todo.json'
+local todo_file = '<<TODO_PATH>>'
+
+local f = io.open(todo_json_path, 'r')
+if not f then
+    vim.notify('No todo items found', vim.log.levels.WARN)
+    return
+end
+local raw = f:read('*a'); f:close()
+local items = vim.json.decode(raw)
+if not items or not items[1] then
+    vim.bo.buftype = 'nofile'
+    vim.api.nvim_buf_set_lines(0, 0, -1, false, {'  No todo items. Press a to add one.'})
+    vim.bo.modifiable = false
+    return
+end
+
+-- Build grouped display lines + non_selectable set (MRU picker pattern)
+local non_selectable = {}
+local row_to_item = {}   -- row -> index into items
+local group_labels = {
+    TODO = '\u{2610}  TODO',
+    ['IN-PROGRESS'] = '\u{25b6}  IN PROGRESS',
+    NOTE = '\u{2139}  NOTES',
+    DONE = '\u{2714}  DONE',
+}
+local group_order = { 'TODO', 'IN-PROGRESS', 'NOTE', 'DONE' }
+
+local function build_display()
+    local lines = {}
+    non_selectable = {}
+    row_to_item = {}
+    local fold_ranges = {}
+    local grouped = {}
+    for i, item in ipairs(items) do
+        local s = item.status
+        if not grouped[s] then grouped[s] = {} end
+        table.insert(grouped[s], { idx = i, item = item })
+    end
+    for _, status in ipairs(group_order) do
+        local group = grouped[status]
+        if group and #group > 0 then
+            if #lines > 0 then
+                table.insert(lines, '')
+                non_selectable[#lines] = true
+            end
+            table.insert(lines, ' ' .. (group_labels[status] or status) .. ' (' .. #group .. ')')
+            non_selectable[#lines] = true
+            local first_item_row = #lines + 1
+            for _, entry in ipairs(group) do
+                local title = entry.item.title
+                local due = (entry.item.due and entry.item.due ~= '') and ('  due:' .. entry.item.due) or ''
+                table.insert(lines, '   ' .. title .. due)
+                row_to_item[#lines] = entry.idx
+            end
+            table.insert(fold_ranges, { first = first_item_row, last = #lines })
+        end
+    end
+    return lines, fold_ranges
+end
+
+-- Setup buffers
+local list_buf = vim.api.nvim_get_current_buf()
+vim.bo[list_buf].buftype = 'nofile'
+pcall(vim.api.nvim_buf_set_name, list_buf, 'todo')
+vim.bo[list_buf].modifiable = false
+
+local preview_buf = vim.api.nvim_create_buf(false, true)
+vim.bo[preview_buf].buftype = 'nofile'
+vim.bo[preview_buf].modifiable = false
+
+-- Setup windows
+local list_win = vim.api.nvim_get_current_win()
+vim.cmd('rightbelow vsplit')
+local preview_win = vim.api.nvim_get_current_win()
+vim.api.nvim_win_set_buf(preview_win, preview_buf)
+vim.wo.wrap = false
+vim.wo.foldenable = false
+vim.wo.number = false
+vim.wo.statusline = ' details'
+
+vim.api.nvim_set_current_win(list_win)
+vim.cmd('vertical resize ' .. math.floor(vim.o.columns * 0.35))
+vim.wo.number = false
+vim.wo.cursorline = true
+vim.wo.wrap = true
+vim.wo.linebreak = true
+vim.wo.breakindent = true
+vim.wo.breakindentopt = 'shift:5'
+vim.wo.foldmethod = 'manual'
+vim.wo.foldenable = true
+vim.wo.foldlevel = 99
+
+local function refresh_display()
+    local lines, fold_ranges = build_display()
+    vim.bo[list_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(list_buf, 0, -1, false, lines)
+    vim.bo[list_buf].modifiable = false
+    -- Recreate folds
+    pcall(function()
+        vim.api.nvim_set_current_win(list_win)
+        vim.cmd('normal! zE')
+        for _, range in ipairs(fold_ranges) do
+            if range.first <= range.last then
+                vim.cmd(range.first .. ',' .. range.last .. 'fold')
+                vim.cmd(range.first .. 'foldopen')
+            end
+        end
+    end)
+end
+
+refresh_display()
+
+-- Navigation (copied from MRU picker)
+local function find_first_selectable()
+    local total = vim.api.nvim_buf_line_count(list_buf)
+    for i = 1, total do
+        if not non_selectable[i] then return i end
+    end
+    return 1
+end
+
+vim.keymap.set('n', 'j', function()
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    local total = vim.api.nvim_buf_line_count(list_buf)
+    for r = row + 1, total do
+        if not non_selectable[r] then
+            pcall(vim.api.nvim_win_set_cursor, list_win, {r, 0})
+            return
+        end
+    end
+end, { buffer = list_buf, noremap = true })
+
+vim.keymap.set('n', 'k', function()
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    for r = row - 1, 1, -1 do
+        if not non_selectable[r] then
+            pcall(vim.api.nvim_win_set_cursor, list_win, {r, 0})
+            return
+        end
+    end
+end, { buffer = list_buf, noremap = true })
+
+local function snap_to_selectable()
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    if non_selectable[row] then
+        local total = vim.api.nvim_buf_line_count(list_buf)
+        for r = row + 1, total do
+            if not non_selectable[r] then
+                pcall(vim.api.nvim_win_set_cursor, list_win, {r, 0})
+                return
+            end
+        end
+        for r = row - 1, 1, -1 do
+            if not non_selectable[r] then
+                pcall(vim.api.nvim_win_set_cursor, list_win, {r, 0})
+                return
+            end
+        end
+    end
+end
+
+for _, key in ipairs({'<C-d>', '<C-u>', '<C-f>', '<C-b>', '<PageDown>', '<PageUp>'}) do
+    vim.keymap.set('n', key, function()
+        vim.cmd('normal! ' .. vim.api.nvim_replace_termcodes(key, true, false, true))
+        snap_to_selectable()
+    end, { buffer = list_buf, noremap = true })
+end
+
+vim.keymap.set('n', 'G', function()
+    vim.cmd('normal! G')
+    snap_to_selectable()
+end, { buffer = list_buf, noremap = true })
+
+vim.keymap.set('n', 'gg', function()
+    pcall(vim.api.nvim_win_set_cursor, list_win, {find_first_selectable(), 0})
+end, { buffer = list_buf, noremap = true })
+
+-- Preview
+local function get_item_at_cursor()
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    local idx = row_to_item[row]
+    if not idx then return nil, row end
+    return items[idx], row
+end
+
+local function update_preview()
+    local item = get_item_at_cursor()
+    if not item then return end
+    local tf = io.open(item.detail_path, 'r')
+    if not tf then return end
+    local content = tf:read('*a'); tf:close()
+    vim.bo[preview_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(preview_buf, 0, -1, false, vim.split(content, '\n'))
+    vim.bo[preview_buf].modifiable = false
+    pcall(vim.api.nvim_win_set_option, preview_win, 'statusline',
+        ' [' .. item.status .. '] ' .. item.title)
+end
+
+vim.api.nvim_create_autocmd('CursorMoved', {
+    buffer = list_buf,
+    callback = function()
+        snap_to_selectable()
+        update_preview()
+    end,
+})
+
+-- Initial position
+pcall(vim.api.nvim_win_set_cursor, list_win, {find_first_selectable(), 0})
+update_preview()
+
+-- Actions
+local function reload_items()
+    vim.fn.system(script .. ' --todo-refresh')
+    local f2 = io.open(todo_json_path, 'r')
+    if not f2 then return end
+    local raw2 = f2:read('*a'); f2:close()
+    local new_items = vim.json.decode(raw2)
+    if new_items then items = new_items end
+    refresh_display()
+    snap_to_selectable()
+    update_preview()
+end
+
+local next_status = {
+    TODO = 'IN-PROGRESS',
+    ['IN-PROGRESS'] = 'DONE',
+    DONE = 'TODO',
+    NOTE = 'DONE',
+}
+
+vim.keymap.set('n', 'd', function()
+    local item, row = get_item_at_cursor()
+    if not item then return end
+    local ns = next_status[item.status] or 'TODO'
+    vim.fn.system(script .. ' --todo-status ' .. item.line_start .. ' ' .. ns)
+    vim.notify(item.title .. ': ' .. item.status .. ' -> ' .. ns .. ' (committed)', vim.log.levels.INFO)
+    reload_items()
+    pcall(vim.api.nvim_win_set_cursor, list_win, {math.min(row, vim.api.nvim_buf_line_count(list_buf)), 0})
+    snap_to_selectable()
+end, { buffer = list_buf, noremap = true })
+
+vim.keymap.set('n', 'a', function()
+    vim.ui.input({ prompt = 'New todo: ' }, function(title)
+        if not title or title == '' then return end
+        vim.fn.system(script .. ' --todo-add ' .. vim.fn.shellescape(title))
+        vim.notify('Added: ' .. title .. ' (committed)', vim.log.levels.INFO)
+        reload_items()
+    end)
+end, { buffer = list_buf, noremap = true })
+
+vim.keymap.set('n', 'e', function()
+    local item, row = get_item_at_cursor()
+    if not item then return end
+    vim.api.nvim_set_current_win(preview_win)
+    vim.cmd('edit +' .. item.line_start .. ' ' .. vim.fn.fnameescape(todo_file))
+    vim.wo.foldmethod = 'marker'
+    vim.wo.foldenable = true
+    vim.wo.foldlevel = 2
+    vim.api.nvim_create_autocmd('BufWritePost', {
+        buffer = vim.api.nvim_get_current_buf(),
+        once = true,
+        callback = function()
+            vim.fn.system(script .. ' --todo-commit ' .. vim.fn.shellescape('Edit item - ' .. item.title))
+            vim.notify('Saved & committed: ' .. item.title, vim.log.levels.INFO)
+            vim.cmd('bdelete')
+            if not vim.api.nvim_win_is_valid(preview_win) then
+                vim.cmd('rightbelow vsplit')
+                preview_win = vim.api.nvim_get_current_win()
+            end
+            vim.api.nvim_win_set_buf(preview_win, preview_buf)
+            vim.api.nvim_set_current_win(list_win)
+            reload_items()
+        end,
+    })
+end, { buffer = list_buf, noremap = true })
+
+vim.keymap.set('n', '<CR>', function()
+    vim.api.nvim_set_current_win(preview_win)
+end, { buffer = list_buf, noremap = true })
+
+vim.keymap.set('n', 'R', reload_items, { buffer = list_buf, noremap = true })
+
+function refresh_todo()
+    reload_items()
+end
+
+pcall(vim.api.nvim_win_set_option, list_win, 'statusline',
+    ' a=add  d=status  e=edit  R=refresh  \u{2502}  qq=back')
+"""
+
+
+# ---------------------------------------------------------------------------
+# Session recovery (snapshot / resume)
+# ---------------------------------------------------------------------------
+
+def capture_sessions():
+    """Snapshot every live session's layout.
+
+    Returns {session_name: [{index, name, cwd}, ...]} (windows sorted by
+    index), excluding the tmux-compose helper session. Returns None when the
+    tmux server is unreachable, so callers can tell "nothing to save" apart
+    from "couldn't ask" and avoid clobbering a good snapshot at crash time.
+    """
+    try:
+        out = subprocess.run(
+            ["tmux", "list-windows", "-a", "-F",
+             "#{session_name}\t#{window_index}\t#{window_name}\t#{pane_current_path}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+    if out.returncode != 0:
+        return None  # no server running, or tmux error
+    sessions = {}
+    for line in out.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        sname, idx, wname, cwd = parts[0], parts[1], parts[2], parts[3]
+        if sname == COMPOSE_SESSION:
+            continue
+        try:
+            idx_i = int(idx)
+        except ValueError:
+            continue
+        sessions.setdefault(sname, []).append(
+            {"index": idx_i, "name": wname, "cwd": cwd})
+    for wins in sessions.values():
+        wins.sort(key=lambda w: w["index"])
+    return sessions
+
+
+def cmd_snapshot():
+    """Write the current layout to RECOVERY_FILE (atomic, with one backup).
+
+    Fails safe: if the tmux server is down or only the helper session exists,
+    the existing snapshot is left untouched rather than overwritten with
+    nothing — a recovery tool should never lose good data because it happened
+    to run mid-crash.
+    """
+    sessions = capture_sessions()
+    if sessions is None:
+        return  # tmux unreachable — keep last good snapshot
+    if not sessions:
+        return  # no real sessions — don't overwrite with emptiness
+
+    data = {
+        "version": RECOVERY_VERSION,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "sessions": [
+            {"name": name, "windows": wins}
+            for name, wins in sorted(sessions.items())
+        ],
+    }
+    os.makedirs(RECOVERY_DIR, exist_ok=True)
+    if os.path.exists(RECOVERY_FILE):
+        try:
+            shutil.copy2(RECOVERY_FILE, RECOVERY_BAK)
+        except OSError:
+            pass
+    tmp = RECOVERY_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, RECOVERY_FILE)  # atomic on POSIX
+
+
+def load_snapshot():
+    """Return (data, source_path) from the snapshot, falling back to the
+    backup if the primary is missing or corrupt. (None, None) if neither
+    is usable."""
+    for path in (RECOVERY_FILE, RECOVERY_BAK):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("sessions"), list):
+            return data, path
+    return None, None
+
+
+def live_session_names():
+    try:
+        out = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return set()
+    if out.returncode != 0:
+        return set()  # no server == no live sessions
+    return set(out.stdout.split())
+
+
+def restore_session(sess):
+    """Recreate one session: windows in saved order, exact names, saved cwd
+    (falling back to $HOME if the dir is gone). Returns (ok, message)."""
+    name = sess.get("name")
+    windows = sorted(sess.get("windows", []), key=lambda w: int(w.get("index", 0)))
+    if not name or not windows:
+        return False, "no windows"
+
+    def safe_cwd(w):
+        cwd = w.get("cwd") or ""
+        return cwd if cwd and os.path.isdir(cwd) else os.path.expanduser("~")
+
+    def lock_name(win_id):
+        # Pin the saved name: disable automatic-rename so a shell/command can't
+        # overwrite it. (new-window -n already disables it on modern tmux; this
+        # makes the guarantee explicit and version-proof.)
+        if win_id:
+            subprocess.run(["tmux", "set-window-option", "-t", win_id,
+                            "automatic-rename", "off"], capture_output=True)
+
+    first = windows[0]
+    r = subprocess.run(
+        ["tmux", "new-session", "-d", "-s", name,
+         "-n", first.get("name") or "win", "-c", safe_cwd(first),
+         "-P", "-F", "#{window_id}"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return False, (r.stderr.strip() or "new-session failed")
+    lock_name(r.stdout.strip())
+
+    for w in windows[1:]:
+        r = subprocess.run(
+            ["tmux", "new-window", "-t", name + ":",
+             "-n", w.get("name") or "win", "-c", safe_cwd(w),
+             "-P", "-F", "#{window_id}"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            lock_name(r.stdout.strip())
+    return True, f"{len(windows)} window(s)"
+
+
+def cmd_resume(args):
+    """Show stored sessions and rebuild the ones that aren't already running.
+
+    Usage:
+      tmux-compose resume            # show snapshot + restore all missing
+      tmux-compose resume --list     # show snapshot only, restore nothing
+      tmux-compose resume <name>...  # restore only the named session(s)
+    """
+    list_only = "--list" in args
+    targets = [a for a in args if not a.startswith("-")]
+
+    data, src = load_snapshot()
+    if not data:
+        print("tmux-compose: no recovery snapshot found.")
+        print("  Take one with:  tmux-compose snapshot")
+        print("  (or enable the periodic snapshot timer)")
+        return
+
+    stored = data.get("sessions", [])
+    live = live_session_names()
+
+    note = "  (restored from backup)" if src == RECOVERY_BAK else ""
+    print(f"Recovery snapshot — saved {data.get('saved_at', '?')}{note}")
+    print(f"{len(stored)} session(s) stored:\n")
+    for s in stored:
+        nm = s.get("name", "?")
+        wins = sorted(s.get("windows", []), key=lambda w: int(w.get("index", 0)))
+        running = nm in live
+        mark = "•" if running else "+"
+        print(f"  {mark} {nm:<24} {len(wins):>2} window(s)   "
+              f"[{'already running' if running else 'resumable'}]")
+        for w in wins:
+            print(f"        {str(w.get('index')):>2}  {(w.get('name') or '?'):<18} {w.get('cwd', '')}")
+    print()
+
+    if list_only:
+        return
+
+    to_restore = [
+        s for s in stored
+        if (not targets or s.get("name") in targets) and s.get("name") not in live
+    ]
+    if not to_restore:
+        if targets:
+            print("Nothing to restore (named session(s) already running or not stored).")
+        else:
+            print("All stored sessions are already running — nothing to restore.")
+        return
+
+    print("Restoring:")
+    for s in to_restore:
+        ok, msg = restore_session(s)
+        print(f"  {'✓' if ok else '✗'} {s.get('name'):<24} {msg}")
+    print("\nDone.  Attach with:  tmux attach -t <session>")
+
+
+# ---------------------------------------------------------------------------
+# Session management
+# ---------------------------------------------------------------------------
+
+def session_exists():
+    r = subprocess.run(
+        ["tmux", "has-session", "-t", COMPOSE_SESSION],
+        capture_output=True,
+    )
+    return r.returncode == 0
+
+
+def ensure_state_dir():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    os.makedirs(os.path.join(STATE_DIR, "tails"), exist_ok=True)
+    os.makedirs(os.path.join(STATE_DIR, "todo_details"), exist_ok=True)
+
+
+def write_lua_files():
+    script_path = os.path.abspath(sys.argv[0])
+    for name, template in [
+        ("common.lua", COMMON_LUA),
+        ("history.lua", HISTORY_LUA),
+        ("compose.lua", COMPOSE_LUA),
+        ("terminals.lua", TERMINALS_LUA),
+        ("status.lua", STATUS_LUA),
+        ("help.lua", HELP_LUA),
+        ("todo.lua", TODO_LUA),
+    ]:
+        content = template.replace("<<STATE_DIR>>", STATE_DIR.replace("'", "\\'"))
+        content = content.replace("<<SCRIPT>>", script_path.replace("'", "\\'"))
+        content = content.replace("<<TODO_PATH>>", TODO_PATH.replace("'", "\\'"))
+        with open(os.path.join(STATE_DIR, name), "w") as f:
+            f.write(content)
+
+
+def write_source_pane(pane_id):
+    label = get_pane_label(pane_id)
+    with open(os.path.join(STATE_DIR, "source_pane_id"), "w") as f:
+        f.write(pane_id)
+    with open(os.path.join(STATE_DIR, "source_label"), "w") as f:
+        f.write(label)
+
+
+def refresh_history(pane_id):
+    tkey = resolve_terminal_key(pane_id)
+    subprocess.run(
+        [sys.executable, os.path.expanduser("~/.local/bin/tmux-pane-history"),
+         "capture", pane_id],
+        capture_output=True,
+    )
+    history = get_merged_history(tkey)
+    if not history:
+        try:
+            history = subprocess.check_output(
+                ["tmux", "capture-pane", "-t", pane_id, "-p", "-e", "-S", "-"],
+                text=True,
+            )
+        except subprocess.CalledProcessError:
+            history = ""
+    with open(os.path.join(STATE_DIR, "history.txt"), "w") as f:
+        f.write(strip_vt100_controls(history))
+
+
+def refresh_terminals_data():
+    term_hists = get_terminal_histories()
+    notes = get_notes()
+    tails_dir = os.path.join(STATE_DIR, "tails")
+    if os.path.exists(tails_dir):
+        shutil.rmtree(tails_dir)
+    os.makedirs(tails_dir, exist_ok=True)
+    terminals_data = []
+    for t_pane_id, content_len, last_ts, db_label in term_hists:
+        try:
+            ts_str = datetime.fromtimestamp(int(last_ts)).strftime("%m/%d %H:%M") if last_ts else "?"
+        except (ValueError, TypeError):
+            ts_str = "?"
+        tail_path = os.path.join(tails_dir,
+                                 t_pane_id.replace("%", "p").replace("@", "_") + ".txt")
+        with open(tail_path, "w") as f:
+            f.write(get_merged_history_tail(t_pane_id, 500))
+        terminals_data.append({
+            "pane": t_pane_id,
+            "label": db_label or t_pane_id,
+            "date": ts_str,
+            "size_kb": content_len // 1024,
+            "tail_path": tail_path,
+            "note": notes.get(t_pane_id, "") or notes.get(t_pane_id.split("@")[0], ""),
+        })
+    with open(os.path.join(STATE_DIR, "terminals.json"), "w") as f:
+        json.dump(terminals_data, f)
+
+
+def refresh_recent_data():
+    recent = get_recent_compositions(20)
+    recent_data = [{"date": (c[1] or "?")[:19], "pane": c[2], "content": c[0]} for c in recent]
+    with open(os.path.join(STATE_DIR, "recent.json"), "w") as f:
+        json.dump(recent_data, f)
+
+
+def create_compose_session():
+    try:
+        cols = subprocess.check_output(
+            ["tmux", "display-message", "-p", "#{window_width}"], text=True
+        ).strip()
+        rows = subprocess.check_output(
+            ["tmux", "display-message", "-p", "#{window_height}"], text=True
+        ).strip()
+    except subprocess.CalledProcessError:
+        cols, rows = "200", "50"
+
+    hist_file = os.path.join(STATE_DIR, "history.txt")
+    compose_file = os.path.join(STATE_DIR, "compose.txt")
+    help_file = os.path.join(STATE_DIR, "help.txt")
+
+    if not os.path.exists(compose_file):
+        with open(compose_file, "w") as f:
+            f.write("")
+
+    nvim_base = ["nvim", "--cmd", "set shadafile=NONE"]
+
+    subprocess.run([
+        "tmux", "new-session", "-d", "-s", COMPOSE_SESSION,
+        "-n", "history", "-x", cols, "-y", rows,
+        *nvim_base, "-S", os.path.join(STATE_DIR, "history.lua"), hist_file,
+    ])
+    subprocess.run([
+        "tmux", "new-window", "-t", COMPOSE_SESSION,
+        "-n", "compose",
+        *nvim_base, "-S", os.path.join(STATE_DIR, "compose.lua"), compose_file,
+    ])
+    subprocess.run([
+        "tmux", "new-window", "-t", COMPOSE_SESSION,
+        "-n", "terminals",
+        *nvim_base, "-S", os.path.join(STATE_DIR, "terminals.lua"),
+    ])
+    subprocess.run([
+        "tmux", "new-window", "-t", COMPOSE_SESSION,
+        "-n", "status",
+        *nvim_base, "-S", os.path.join(STATE_DIR, "status.lua"),
+    ])
+    subprocess.run([
+        "tmux", "new-window", "-t", COMPOSE_SESSION,
+        "-n", "help",
+        *nvim_base, "-S", os.path.join(STATE_DIR, "help.lua"), help_file,
+    ])
+    subprocess.run([
+        "tmux", "new-window", "-t", COMPOSE_SESSION,
+        "-n", "todo",
+        *nvim_base, "--cmd", "let g:loaded_netrwPlugin=1", "-S", os.path.join(STATE_DIR, "todo.lua"),
+    ])
+    subprocess.run([
+        "tmux", "new-window", "-t", COMPOSE_SESSION,
+        "-n", "btop",
+        "btop",
+    ])
+
+
+# ---------------------------------------------------------------------------
+# Main subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_ensure(pane_id, target_window):
+    ensure_state_dir()
+    write_lua_files()
+    write_source_pane(pane_id)
+
+    with open(os.path.join(STATE_DIR, "help.txt"), "w") as f:
+        f.write(HELP_TEXT)
+
+    if target_window == "history":
+        refresh_history(pane_id)
+    elif target_window == "terminals":
+        refresh_terminals_data()
+    elif target_window == "todo":
+        refresh_todo_data()
+
+    if not session_exists():
+        if target_window != "history":
+            refresh_history(pane_id)
+        if target_window != "terminals":
+            refresh_terminals_data()
+        refresh_todo_data()
+        refresh_recent_data()
+        create_compose_session()
+    else:
+        # Check if target window exists, recreate if missing
+        r = subprocess.run(
+            ["tmux", "list-windows", "-t", COMPOSE_SESSION,
+             "-F", "#{window_name}"],
+            capture_output=True, text=True,
+        )
+        existing_windows = set(r.stdout.strip().splitlines()) if r.returncode == 0 else set()
+
+        nvim_base = ["nvim", "--cmd", "set shadafile=NONE"]
+        hist_file = os.path.join(STATE_DIR, "history.txt")
+        compose_file = os.path.join(STATE_DIR, "compose.txt")
+        help_file = os.path.join(STATE_DIR, "help.txt")
+
+        if not os.path.exists(compose_file):
+            with open(compose_file, "w") as f:
+                f.write("")
+
+        window_cmds = {
+            "history": [*nvim_base, "-S", os.path.join(STATE_DIR, "history.lua"), hist_file],
+            "compose": [*nvim_base, "-S", os.path.join(STATE_DIR, "compose.lua"), compose_file],
+            "terminals": [*nvim_base, "-S", os.path.join(STATE_DIR, "terminals.lua")],
+            "status": [*nvim_base, "-S", os.path.join(STATE_DIR, "status.lua")],
+            "help": [*nvim_base, "-S", os.path.join(STATE_DIR, "help.lua"), help_file],
+            "todo": [*nvim_base, "--cmd", "let g:loaded_netrwPlugin=1", "-S", os.path.join(STATE_DIR, "todo.lua")],
+            "btop": ["btop"],
+        }
+
+        for wname, wcmd in window_cmds.items():
+            if wname not in existing_windows:
+                subprocess.run([
+                    "tmux", "new-window", "-t", COMPOSE_SESSION,
+                    "-n", wname, *wcmd,
+                ])
+
+        # Signal running nvim to reload if window was already alive
+        if target_window == "history" and "history" in existing_windows:
+            subprocess.run([
+                "tmux", "send-keys", "-t", f"{COMPOSE_SESSION}:history",
+                ":silent lua reload_history()", "Enter",
+            ])
+        elif target_window == "status" and "status" in existing_windows:
+            subprocess.run([
+                "tmux", "send-keys", "-t", f"{COMPOSE_SESSION}:status",
+                ":silent lua refresh_status()", "Enter",
+            ])
+        elif target_window == "todo" and "todo" in existing_windows:
+            # Kill and recreate to get fresh data
+            subprocess.run([
+                "tmux", "kill-window", "-t", f"{COMPOSE_SESSION}:todo",
+            ], capture_output=True)
+            subprocess.run([
+                "tmux", "new-window", "-t", COMPOSE_SESSION,
+                "-n", "todo",
+                *window_cmds["todo"],
+            ])
+
+
+def cmd_send_compose():
+    source_file = os.path.join(STATE_DIR, "source_pane_id")
+    compose_file = os.path.join(STATE_DIR, "compose.txt")
+    if not os.path.exists(source_file) or not os.path.exists(compose_file):
+        return
+    with open(source_file) as f:
+        pane_id = f.read().strip()
+    with open(compose_file) as f:
+        content = f.read().strip()
+    if not content:
+        return
+    save_composition(get_pane_label(pane_id), content)
+    buf_file = tempfile.mktemp(prefix="tmux_paste_")
+    with open(buf_file, "w") as f:
+        f.write(content)
+    subprocess.run(["tmux", "load-buffer", buf_file])
+    subprocess.run(["tmux", "paste-buffer", "-t", pane_id, "-d"])
+    os.unlink(buf_file)
+
+
+def cmd_clip_compose():
+    compose_file = os.path.join(STATE_DIR, "compose.txt")
+    source_file = os.path.join(STATE_DIR, "source_pane_id")
+    if not os.path.exists(compose_file):
+        return
+    with open(compose_file) as f:
+        content = f.read().strip()
+    if not content:
+        return
+    label = "clipboard"
+    if os.path.exists(source_file):
+        with open(source_file) as f:
+            label = get_pane_label(f.read().strip())
+    save_composition(label, content)
+    subprocess.run(["tmux", "set-buffer", content])
+    for clip_cmd in [["xclip", "-selection", "clipboard"],
+                     ["xsel", "--clipboard", "--input"],
+                     ["wl-copy"]]:
+        try:
+            subprocess.run(clip_cmd, input=content, text=True,
+                           timeout=2, stderr=subprocess.DEVNULL)
+            break
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            continue
+
+
+def cmd_refresh_history(pane_key):
+    content = get_merged_history(pane_key)
+    if not content:
+        return
+    with open(os.path.join(STATE_DIR, "history.txt"), "w") as f:
+        f.write(strip_vt100_controls(content))
+    # Update label
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    row = conn.execute(
+        "SELECT label FROM merged WHERE pane_id = ?", (pane_key,)
+    ).fetchone()
+    conn.close()
+    with open(os.path.join(STATE_DIR, "source_label"), "w") as f:
+        f.write(row[0] if row and row[0] else pane_key)
+    if session_exists():
+        subprocess.run([
+            "tmux", "send-keys", "-t", f"{COMPOSE_SESSION}:history",
+            ":silent lua reload_history()", "Enter",
+        ])
+
+
+def cmd_reset():
+    subprocess.run(
+        ["tmux", "kill-session", "-t", COMPOSE_SESSION],
+        capture_output=True,
+    )
+    if os.path.exists(STATE_DIR):
+        shutil.rmtree(STATE_DIR)
+    print("Reset complete.")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: tmux-compose <ensure|fork|send-compose|clip-compose|refresh-history|reset|snapshot|resume|--search|--note|--dump|--status>")
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    if cmd in ("-h", "--help", "help"):
+        print(HELP_TEXT)
+        return
+    if cmd == "snapshot":
+        cmd_snapshot()
+        return
+    if cmd == "resume":
+        cmd_resume(sys.argv[2:])
+        return
+    if cmd == "fork":
+        cmd_fork(sys.argv[2:])
+        return
+    if cmd == "fork-prompt":
+        cmd_fork_prompt(sys.argv[2:])
+        return
+    if cmd == "--search":
+        cmd_search(sys.argv[2:])
+    elif cmd == "--note":
+        cmd_note(sys.argv[2:])
+    elif cmd == "--dump":
+        cmd_dump(sys.argv[2:])
+    elif cmd == "--status":
+        cmd_status(sys.argv[2:])
+    elif cmd == "ensure" and len(sys.argv) >= 4:
+        cmd_ensure(sys.argv[2], sys.argv[3])
+    elif cmd == "send-compose":
+        cmd_send_compose()
+    elif cmd == "clip-compose":
+        cmd_clip_compose()
+    elif cmd == "refresh-history" and len(sys.argv) >= 3:
+        cmd_refresh_history(sys.argv[2])
+    elif cmd == "--todo-add":
+        cmd_todo_add(sys.argv[2:])
+    elif cmd == "--todo-status":
+        cmd_todo_update_status(sys.argv[2:])
+    elif cmd == "--todo-refresh":
+        refresh_todo_data()
+    elif cmd == "--todo-commit":
+        git_commit_todo(" ".join(sys.argv[2:]) if len(sys.argv) > 2 else "Edit todo")
+    elif cmd == "reset":
+        cmd_reset()
+    elif cmd == "create-window" and len(sys.argv) >= 3:
+        cmd_create_window(sys.argv[2])
+    elif cmd == "create-split" and len(sys.argv) >= 3:
+        cmd_create_split(sys.argv[2])
+    elif cmd == "--toggle-prompt-on-create":
+        cmd_toggle_prompt_on_create()
+    elif cmd == "--get-prompt-on-create":
+        print("on" if get_prompt_on_create() else "off")
+    elif cmd == "--toggle-codex-auto-edits":
+        cmd_toggle_codex_auto_edits()
+    elif cmd == "--get-codex-auto-edits":
+        print("on" if get_codex_auto_edits() else "off")
+    elif cmd == "--toggle-codex-approve-all":
+        cmd_toggle_codex_approve_all()
+    elif cmd == "--get-codex-approve-all":
+        print("on" if get_codex_approve_all() else "off")
+    else:
+        print(f"Unknown command: {cmd}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

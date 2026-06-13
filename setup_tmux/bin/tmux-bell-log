@@ -1,0 +1,36 @@
+#!/bin/bash
+# Logs a tmux bell event with location, command, pane state, and process tree.
+# Invoked from `set-hook -g alert-bell 'run-shell ...'`.
+# Args: <loc> <cmd> <cwd> <pane_pid> <pane_id>
+
+set -u
+
+LOG="$HOME/.cache/tmux/bell.log"
+mkdir -p "$(dirname "$LOG")"
+
+loc="${1:-?}"
+cmd="${2:-?}"
+cwd="${3:-?}"
+pid="${4:-?}"
+pane="${5:-}"
+
+{
+  printf '%s  loc=%s  cmd=%s  pid=%s  cwd=%s\n' \
+    "$(date '+%F %H:%M:%S')" "$loc" "$cmd" "$pid" "$cwd"
+
+  if [ -n "$pid" ] && [ "$pid" != "?" ]; then
+    # Process tree under the pane's foreground process — often reveals the
+    # actual offender (e.g. a test runner spawned by bash).
+    if command -v pstree >/dev/null 2>&1; then
+      pstree -p "$pid" 2>/dev/null | sed 's/^/  tree: /'
+    else
+      ps -o pid,ppid,comm --forest -g "$pid" 2>/dev/null | sed 's/^/  ps: /'
+    fi
+  fi
+
+  if [ -n "$pane" ]; then
+    echo "  --- last 8 lines of pane ---"
+    tmux capture-pane -t "$pane" -p -S -8 2>/dev/null | sed 's/^/  | /'
+  fi
+  echo "==="
+} >> "$LOG"

@@ -1,15 +1,15 @@
 # GitDiff
 
 Two-pane git diff browser for Neovim. Top pane shows changed files, bottom pane
-shows git log with source/target markers. Press Enter on a file to open a
-split diff in a new tab (source left, target right).
+shows a colorized `git log --graph` with source/target markers. Press Enter on
+a file to open a split diff in a new tab (source left, target right).
 
 ## Install
 
-With vim-plug:
+This repo installs GitDiff as a local Neovim pack plugin:
 
 ```
-Plug '~/software/gitdiff'
+~/.config/nvim/pack/local/start/gitdiff
 ```
 
 ## Setup
@@ -17,8 +17,9 @@ Plug '~/software/gitdiff'
 ```
 lua << EOF
 require("gitdiffiles").setup({
-  log_max = 200,
+  log_max = 0,
   log_view = "oneline",
+  diff_mode = "pr",
   ui = {
     open_in_tab = true,
     file_height = nil,
@@ -31,6 +32,7 @@ require("gitdiffiles").setup({
     set_source = "s",
     set_target = "t",
     toggle_log = "L",
+    toggle_mode = "m",
   },
 })
 EOF
@@ -42,8 +44,12 @@ EOF
 :GitDiff
 :GitDiff HEAD
 :GitDiff origin/HEAD
+:GitDiff origin/main
 :GitDiff HEAD~3 HEAD
 ```
+
+`log_max = 0` means "show the full log" instead of truncating after a fixed count.
+Both one-line and full log views use `git log --graph`.
 
 ## Keys
 
@@ -57,10 +63,19 @@ Log pane:
 
 - `s` set source commit (commit lines only)
 - `t` set target commit (commit or WORKDIR line)
-- `L` toggle log view (one-line vs full)
+- `L` toggle log view (one-line graph vs full graph)
+- `m` toggle diff mode (`PR` merge-base mode vs `ALL` branch-base mode)
 - `r` refresh
 - `q` close
 
 The first log line is always a WORKDIR pseudo-entry (uncommitted changes).
-Target defaults to WORKDIR; source defaults to the top commit in the log.
-Both panes use winbars to show the current source/target selection.
+Target defaults to WORKDIR. Source defaults to the first available ref from
+`origin/HEAD`, `origin/main`, `origin/master`, `main`, `master`, then falls back
+to the top commit in the log if none of those resolve.
+Both panes show the active diff mode and the toggle key in the winbar.
+
+## Diff Modes
+
+- `PR` mode diffs from the merge-base of the selected source and target, which hides changes that only came from merging the upstream branch back into your working branch.
+- `ALL` mode diffs from the branch base along the target's first-parent history, so merged upstream changes stay visible.
+- The log marks the computed merge-base with a highlighted `[MERGE-BASE]` tag.

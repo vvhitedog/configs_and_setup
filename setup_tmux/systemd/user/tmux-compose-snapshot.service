@@ -1,0 +1,6 @@
+[Unit]
+Description=Snapshot tmux session layout for tmux-compose recovery
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/tmux-compose snapshot

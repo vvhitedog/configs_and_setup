@@ -4,10 +4,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 MODE="interview"
+OVERWRITE=0
+ENABLE_SYSTEMD=1
+TERMINAL_MODE="terminator"
 SKIP_NEOVIM=0
 SKIP_TMUX=0
+SKIP_TMUX_COMPOSE=0
 SKIP_ATUIN=0
-SKIP_GHOSTTY=0
+SKIP_TERMINATOR=0
+SKIP_GHOSTTY=1
 SKIP_BASE=0
 SKIP_FONTS=0
 
@@ -26,13 +31,18 @@ Usage: setup_ubuntu.sh [options]
 
 Options:
   --interview            Ask about installs and overwrites (default)
-  --yolo                 Install everything and overwrite without asking
+  --yolo, --yes          Install selected components and overwrite without asking
+  --overwrite, --force   Overwrite existing configs without prompts, but keep install prompts
+  --terminal MODE        Terminal target: terminator (default), ghostty, both, none
   --skip-neovim          Skip installing or upgrading neovim
   --skip-tmux            Skip installing or upgrading tmux
+  --skip-tmux-compose    Skip tmux-compose helpers and user services
   --skip-atuin           Skip installing or upgrading atuin
-  --skip-ghostty         Skip installing or upgrading ghostty
+  --skip-terminator      Skip installing or syncing terminator
+  --skip-ghostty         Skip installing or syncing ghostty
   --skip-base            Skip installing base packages
   --skip-fonts           Skip installing Sauce Code Pro fonts
+  --no-systemd           Copy tmux-compose helpers, but do not enable user services
   -h, --help             Show this help
 EOF
 }
@@ -80,6 +90,17 @@ apt_install() {
 apt_has_pkg() {
   local pkg="$1"
   apt-cache show "$pkg" >/dev/null 2>&1
+}
+
+apt_install_optional() {
+  local pkg
+  for pkg in "$@"; do
+    if apt_has_pkg "$pkg"; then
+      apt_install "$pkg"
+    else
+      echo "Optional apt package not found, skipping: $pkg"
+    fi
+  done
 }
 
 ensure_command() {
@@ -161,6 +182,14 @@ get_yarn_version() {
   yarn --version 2>/dev/null | sed -E 's/[^0-9.].*$//'
 }
 
+copy_file_unprompted() {
+  local src="$1"
+  local dest="$2"
+
+  mkdir -p "$(dirname "$dest")"
+  cp -a "$src" "$dest"
+}
+
 copy_file() {
   local src="$1"
   local dest="$2"
@@ -171,7 +200,12 @@ copy_file() {
     return 1
   fi
 
-  if [[ "$MODE" != "yolo" ]]; then
+  if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
+    echo "$label is already up to date: $dest"
+    return 0
+  fi
+
+  if [[ "$MODE" != "yolo" && "$OVERWRITE" -ne 1 ]]; then
     if [[ -e "$dest" ]]; then
       if ! prompt_yes_no "Overwrite $label at $dest?" "y"; then
         return 0
@@ -183,8 +217,7 @@ copy_file() {
     fi
   fi
 
-  mkdir -p "$(dirname "$dest")"
-  cp -a "$src" "$dest"
+  copy_file_unprompted "$src" "$dest"
 }
 
 copy_dir() {
@@ -197,7 +230,12 @@ copy_dir() {
     return 1
   fi
 
-  if [[ "$MODE" != "yolo" ]]; then
+  if [[ -d "$dest" ]] && command -v diff >/dev/null 2>&1 && diff -qr "$src" "$dest" >/dev/null 2>&1; then
+    echo "$label is already up to date: $dest"
+    return 0
+  fi
+
+  if [[ "$MODE" != "yolo" && "$OVERWRITE" -ne 1 ]]; then
     if [[ -e "$dest" ]]; then
       if ! prompt_yes_no "Overwrite $label at $dest?" "y"; then
         return 0
@@ -395,11 +433,25 @@ install_ghostty() {
   sudo snap install ghostty --classic
 }
 
+install_terminator() {
+  if command -v terminator >/dev/null 2>&1; then
+    if ! prompt_yes_no "Terminator already installed. Reinstall/upgrade?" "y"; then
+      return 0
+    fi
+  else
+    if ! prompt_yes_no "Install terminator?" "y"; then
+      return 0
+    fi
+  fi
+  apt_install terminator
+}
+
 install_base() {
-  if ! prompt_yes_no "Install base packages (curl git ripgrep fzf xsel unzip fontconfig)?" "y"; then
+  if ! prompt_yes_no "Install base packages (curl git ripgrep fzf xsel unzip fontconfig python3)?" "y"; then
     return 0
   fi
-  apt_install curl git ripgrep fzf xsel unzip fontconfig
+  apt_install curl git ripgrep fzf xsel unzip fontconfig python3
+  apt_install_optional btop xclip wl-clipboard
 }
 
 install_vim_plug() {
@@ -541,8 +593,66 @@ sync_ghostty() {
   copy_file "$SCRIPT_DIR/setup_ghostty/config" "$HOME/.config/ghostty/config" "Ghostty config"
 }
 
+sync_terminator() {
+  copy_file "$SCRIPT_DIR/setup_terminator/config" "$HOME/.config/terminator/config" "Terminator config"
+}
+
 sync_tmux() {
   copy_file "$SCRIPT_DIR/setup_tmux/tmux.conf" "$HOME/.tmux.conf" "tmux config"
+}
+
+sync_tmux_compose() {
+  local bin_src_dir="$SCRIPT_DIR/setup_tmux/bin"
+  local unit_src_dir="$SCRIPT_DIR/setup_tmux/systemd/user"
+  local src dest unit
+
+  if [[ ! -d "$bin_src_dir" ]]; then
+    echo "tmux-compose helper directory not found: $bin_src_dir"
+    return 0
+  fi
+
+  if [[ "$MODE" != "yolo" && "$OVERWRITE" -ne 1 ]]; then
+    if ! prompt_yes_no "Install/update tmux-compose helper scripts?" "y"; then
+      return 0
+    fi
+  fi
+
+  ensure_dir "$HOME/.local/bin"
+  for src in "$bin_src_dir"/*; do
+    [[ -f "$src" ]] || continue
+    dest="$HOME/.local/bin/$(basename "$src")"
+    copy_file_unprompted "$src" "$dest"
+    chmod +x "$dest" || true
+  done
+
+  if [[ -d "$unit_src_dir" ]]; then
+    ensure_dir "$HOME/.config/systemd/user"
+    for unit in "$unit_src_dir"/*; do
+      [[ -f "$unit" ]] || continue
+      copy_file_unprompted "$unit" "$HOME/.config/systemd/user/$(basename "$unit")"
+    done
+  fi
+
+  if [[ "$ENABLE_SYSTEMD" -ne 1 ]]; then
+    return 0
+  fi
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "systemctl not found; copied tmux-compose units but did not enable them."
+    return 0
+  fi
+  if [[ "$MODE" != "yolo" && "$OVERWRITE" -ne 1 ]]; then
+    if ! prompt_yes_no "Enable/start tmux-compose user services and snapshot timer?" "y"; then
+      return 0
+    fi
+  fi
+
+  if ! systemctl --user daemon-reload; then
+    echo "WARNING: systemctl --user daemon-reload failed; user services were not enabled."
+    return 0
+  fi
+  if ! systemctl --user enable --now tmux-pane-history.service tmux-window-usage.service tmux-compose-snapshot.timer; then
+    echo "WARNING: failed to enable/start one or more tmux-compose user units."
+  fi
 }
 
 sync_atuin() {
@@ -560,19 +670,29 @@ sync_bash() {
 sync_neovim() {
   copy_file "$SCRIPT_DIR/setup_neovim/init.vim" "$HOME/.config/nvim/init.vim" "neovim init.vim"
   copy_file "$SCRIPT_DIR/setup_neovim/coc-settings.json" "$HOME/.config/nvim/coc-settings.json" "neovim coc-settings.json"
-  copy_dir "$SCRIPT_DIR/setup_neovim/local_plugins/keymap-cheatsheet.nvim" \
-    "$HOME/.config/nvim/pack/local/start/keymap-cheatsheet.nvim" \
-    "neovim keymap-cheatsheet.nvim"
-
-  copy_dir "$SCRIPT_DIR/setup_neovim/local_plugins/gitdiff" \
-    "$HOME/.config/nvim/pack/local/start/gitdiff" \
-    "neovim gitdiff local plugin"
+  local plugin_dir plugin_name
+  for plugin_dir in "$SCRIPT_DIR/setup_neovim/local_plugins"/*; do
+    [[ -d "$plugin_dir" ]] || continue
+    plugin_name="$(basename "$plugin_dir")"
+    copy_dir "$plugin_dir" "$HOME/.config/nvim/pack/local/start/$plugin_name" \
+      "neovim local plugin $plugin_name"
+  done
 
   copy_file "$SCRIPT_DIR/setup_neovim/git-diff3-view.py" "$HOME/.local/bin/git-diff3-view.py" "git-diff3-view.py"
   copy_file "$SCRIPT_DIR/setup_neovim/clang-rename.py" "$HOME/.local/bin/clang-rename.py" "clang-rename.py"
   copy_file "$SCRIPT_DIR/setup_neovim/ccls-docker" "$HOME/.local/bin/ccls-docker" "ccls-docker wrapper"
 
-  chmod +x "$HOME/.local/bin/git-diff3-view.py" "$HOME/.local/bin/clang-rename.py" "$HOME/.local/bin/ccls-docker" || true
+  local helper
+  local helpers=(
+    "$HOME/.local/bin/git-diff3-view.py"
+    "$HOME/.local/bin/clang-rename.py"
+    "$HOME/.local/bin/ccls-docker"
+  )
+  for helper in "${helpers[@]}"; do
+    if [[ -e "$helper" ]]; then
+      chmod +x "$helper"
+    fi
+  done
 }
 
 atuin_import_bash() {
@@ -584,20 +704,78 @@ atuin_import_bash() {
   fi
 }
 
+selected_terminals() {
+  local terms=()
+  [[ "$SKIP_TERMINATOR" -ne 1 ]] && terms+=("terminator")
+  [[ "$SKIP_GHOSTTY" -ne 1 ]] && terms+=("ghostty")
+  if [[ "${#terms[@]}" -eq 0 ]]; then
+    echo "none"
+  else
+    local IFS=,
+    echo "${terms[*]}"
+  fi
+}
+
+print_summary() {
+  echo "configs_and_setup install"
+  echo "  mode: $MODE"
+  echo "  overwrite configs: $([[ "$MODE" == "yolo" || "$OVERWRITE" -eq 1 ]] && echo yes || echo prompt)"
+  echo "  terminals: $(selected_terminals)"
+  echo "  tmux-compose services: $([[ "$ENABLE_SYSTEMD" -eq 1 && "$SKIP_TMUX_COMPOSE" -ne 1 ]] && echo enabled || echo disabled)"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --interview)
       MODE="interview"
       ;;
-    --yolo)
+    --yolo|--yes)
       MODE="yolo"
+      OVERWRITE=1
+      ;;
+    --overwrite|--force)
+      OVERWRITE=1
+      ;;
+    --terminal)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "--terminal requires one of: terminator, ghostty, both, none"
+        exit 1
+      fi
+      TERMINAL_MODE="$1"
+      case "$TERMINAL_MODE" in
+        terminator)
+          SKIP_TERMINATOR=0
+          SKIP_GHOSTTY=1
+          ;;
+        ghostty)
+          SKIP_TERMINATOR=1
+          SKIP_GHOSTTY=0
+          ;;
+        both)
+          SKIP_TERMINATOR=0
+          SKIP_GHOSTTY=0
+          ;;
+        none)
+          SKIP_TERMINATOR=1
+          SKIP_GHOSTTY=1
+          ;;
+        *)
+          echo "Unknown terminal mode: $TERMINAL_MODE"
+          echo "Expected one of: terminator, ghostty, both, none"
+          exit 1
+          ;;
+      esac
       ;;
     --skip-neovim) SKIP_NEOVIM=1 ;;
     --skip-tmux) SKIP_TMUX=1 ;;
+    --skip-tmux-compose) SKIP_TMUX_COMPOSE=1 ;;
     --skip-atuin) SKIP_ATUIN=1 ;;
+    --skip-terminator) SKIP_TERMINATOR=1 ;;
     --skip-ghostty) SKIP_GHOSTTY=1 ;;
     --skip-base) SKIP_BASE=1 ;;
     --skip-fonts) SKIP_FONTS=1 ;;
+    --no-systemd) ENABLE_SYSTEMD=0 ;;
     -h|--help)
       usage
       exit 0
@@ -610,6 +788,8 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+print_summary
 
 if [[ "$SKIP_BASE" -ne 1 ]]; then
   install_base
@@ -624,6 +804,9 @@ fi
 if [[ "$SKIP_ATUIN" -ne 1 ]]; then
   install_atuin
 fi
+if [[ "$SKIP_TERMINATOR" -ne 1 ]]; then
+  install_terminator
+fi
 if [[ "$SKIP_GHOSTTY" -ne 1 ]]; then
   install_ghostty
 fi
@@ -631,11 +814,19 @@ if [[ "$SKIP_FONTS" -ne 1 ]]; then
   install_fonts
 fi
 
-sync_ghostty
+if [[ "$SKIP_TERMINATOR" -ne 1 ]]; then
+  sync_terminator
+fi
+if [[ "$SKIP_GHOSTTY" -ne 1 ]]; then
+  sync_ghostty
+fi
 sync_neovim
 install_vim_plug
 sync_atuin
 sync_tmux
+if [[ "$SKIP_TMUX_COMPOSE" -ne 1 ]]; then
+  sync_tmux_compose
+fi
 sync_bash
 atuin_import_bash
 run_plug_install

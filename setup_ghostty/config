@@ -3,7 +3,7 @@
 # This template file has been automatically created at the following
 # path since Ghostty couldn't find any existing config files on your system:
 #
-#   /home/mgara/.config/ghostty/config
+#   ~/.config/ghostty/config
 #
 # The template does not set any default options, since Ghostty ships
 # with sensible defaults for all options. Users should only need to set
@@ -20,7 +20,7 @@
 # Control + Shift + comma on other platforms). Not all config options can be
 # reloaded while running; some only apply to new windows and others may require
 # a full restart to take effect.
-#
+
 # Config syntax crash course
 # ==========================
 # # The config file consists of simple key-value pairs,
@@ -50,8 +50,12 @@
 
 
 cursor-style-blink = true
-cursor-style = "block"
+cursor-style = block
 
+font-family = ""
 font-family = "SauceCodePro Nerd Font Mono"
 
 app-notifications = no-clipboard-copy
+
+# Workaround for cursor bug - disable shell integration cursor control
+shell-integration-features = no-cursor

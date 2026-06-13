@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+import time
+import traceback
+from pathlib import Path
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "tmux"
+DATA_PATH = CACHE_DIR / "window-usage.json"
+LOG_PATH = CACHE_DIR / "tmux-window-usage.log"
+META_KEY = "__meta__"
+LABEL_FG = "#8c95a3"
+
+
+def _log_exc(cmd):
+    """Append a timestamped traceback to the log. Best-effort; never raises."""
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_PATH, "a") as f:
+            f.write("\n=== %s  cmd=%s ===\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), cmd))
+            f.write(traceback.format_exc())
+    except OSError:
+        pass
+def load_data():
+    if not DATA_PATH.exists():
+        return {}
+    try:
+        data = json.loads(DATA_PATH.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+def save_data(data):
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = DATA_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(DATA_PATH)
+def format_label(freq_ratio):
+    percent = int(round(freq_ratio * 100))
+    if percent < 0:
+        percent = 0
+    elif percent > 100:
+        percent = 100
+    percent_str = f"{percent:3d}%"
+    return f"#[fg={LABEL_FG}]freq: {percent_str}#[default]"
+
+
+def format_unknown():
+    return f"#[fg={LABEL_FG}]freq:   ?%#[default]"
+def cmd_record(win_id):
+    data = load_data()
+    now = int(time.time())
+    meta = data.get(META_KEY)
+    if not isinstance(meta, dict):
+        meta = {}
+    seq = int(meta.get("seq", 0)) + 1
+    meta["seq"] = seq
+    data[META_KEY] = meta
+    entry = data.get(win_id, {})
+    entry["last"] = now
+    entry["count"] = int(entry.get("count", 0)) + 1
+    entry["seq"] = seq
+    data[win_id] = entry
+    save_data(data)
+
+
+def _touch_window(win_id):
+    data = load_data()
+    now = int(time.time())
+    meta = data.get(META_KEY)
+    if not isinstance(meta, dict):
+        meta = {}
+    seq = int(meta.get("seq", 0)) + 1
+    meta["seq"] = seq
+    data[META_KEY] = meta
+    entry = data.get(win_id, {})
+    entry["last"] = now
+    entry.setdefault("count", 0)
+    entry["seq"] = seq
+    data[win_id] = entry
+    save_data(data)
+def cmd_status(win_id):
+    data = load_data()
+    window_ids = _list_windows(all_sessions=True)
+    activity = _window_activity_map(all_sessions=True)
+    info = _collect_info(window_ids, data, activity)
+    rank_map = _build_rank_map(info)
+    freq_map = _build_freq_map(info, data)
+    freq = freq_map.get(win_id)
+    if freq is None:
+        sys.stdout.write(format_unknown())
+        return
+    sys.stdout.write(format_label(freq))
+
+
+def _run_tmux(args, check=False):
+    return subprocess.run(["tmux", *args], check=check, text=True, stdout=subprocess.PIPE)
+
+
+def _list_windows(target=None, all_sessions=False):
+    cmd = ["list-windows"]
+    if all_sessions:
+        cmd.append("-a")
+    cmd += ["-F", "#{window_id}"]
+    if target and not all_sessions:
+        cmd += ["-t", target]
+    out = _run_tmux(cmd, check=True).stdout
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def _active_window_id(target=None):
+    cmd = ["display-message", "-p", "#{window_id}"]
+    if target:
+        cmd += ["-t", target]
+    out = _run_tmux(cmd, check=True).stdout.strip()
+    return out or None
+
+
+def _set_window_age(window_id, age_label):
+    _run_tmux(["set-option", "-w", "-t", window_id, "@usage_age", age_label])
+
+
+def _window_activity_map(target=None, all_sessions=False):
+    cmd = ["list-windows"]
+    if all_sessions:
+        cmd.append("-a")
+    cmd += ["-F", "#{window_id} #{window_activity}"]
+    if target and not all_sessions:
+        cmd += ["-t", target]
+    out = _run_tmux(cmd, check=True).stdout
+    activity = {}
+    for line in out.splitlines():
+        parts = line.strip().split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        window_id, raw_ts = parts
+        if raw_ts.isdigit():
+            ts = int(raw_ts)
+            if ts > 0:
+                activity[window_id] = ts
+    return activity
+
+
+def _window_active_map(target=None, all_sessions=False):
+    cmd = ["list-windows"]
+    if all_sessions:
+        cmd.append("-a")
+    cmd += ["-F", "#{window_id} #{window_active}"]
+    if target and not all_sessions:
+        cmd += ["-t", target]
+    out = _run_tmux(cmd, check=True).stdout
+    active = {}
+    for line in out.splitlines():
+        parts = line.strip().split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        window_id, raw_flag = parts
+        active[window_id] = raw_flag == "1"
+    return active
+
+
+def _entry_timestamp(entry):
+    if not entry or "last" not in entry:
+        return None
+    raw = entry.get("last")
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        return int(raw)
+    if isinstance(raw, str) and raw.isdigit():
+        return int(raw)
+    return None
+
+
+def _entry_seq(entry):
+    if not entry or "seq" not in entry:
+        return None
+    raw = entry.get("seq")
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, float):
+        return int(raw)
+    if isinstance(raw, str) and raw.isdigit():
+        return int(raw)
+    return None
+
+
+def _collect_info(window_ids, data, activity):
+    info = {}
+    for window_id in window_ids:
+        entry = data.get(window_id)
+        ts = _entry_timestamp(entry)
+        if ts is None:
+            ts = activity.get(window_id)
+        seq = _entry_seq(entry)
+        info[window_id] = {
+            "ts": ts if ts is not None else 0,
+            "seq": seq if seq is not None else 0,
+        }
+    return info
+
+
+def _build_rank_map(info):
+    items = list(info.items())
+    items.sort(key=lambda item: (item[1]["ts"], item[1]["seq"]), reverse=True)
+    rank_map = {}
+    for idx, (window_id, _data) in enumerate(items):
+        rank_map[window_id] = idx
+    return rank_map
+
+
+def _build_freq_map(info, data):
+    total = 0
+    counts = {}
+    for window_id in info.keys():
+        entry = data.get(window_id) or {}
+        count = entry.get("count", 0)
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            count = 0
+        counts[window_id] = count
+        total += count
+    if total <= 0:
+        return {window_id: 0.0 for window_id in info.keys()}
+    return {window_id: counts[window_id] / total for window_id in info.keys()}
+
+
+NAME_PAD = 10
+
+CLAUDE_FROZEN = "\u2733"  # ✳ U+2733 — claude frozen (needs action or done)
+
+PROMPT_SUFFIXES = ("$", "#", "%", ">>>", ">")
+
+# Patterns that mean a permission/confirmation prompt is showing
+PERMISSION_PATTERNS = (
+    "Do you want to ",    # claude code: "Do you want to proceed/create/etc?"
+    "Proceed (y)",        # agent: proceed with action
+    "allowlist",          # agent: add to allowlist
+    "Write to this file", # agent: file write confirmation
+    "Reject & propose",   # agent: reject option visible
+)
+
+# States: "ready" (▸), "busy" (▪), "blocked" (↵), "vim" (◆)
+SYM_READY = "\u25b8"    # ▸
+SYM_BUSY = "\u25aa"     # ▪
+SYM_BLOCKED = "\u21b5"  # ↵
+SYM_VIM = "\u270e"      # ✎
+
+VI_COMMANDS = {"vim", "nvim", "vi", "vimdiff", "nvim-qt"}
+
+
+def _shell_is_foreground(pane_pid):
+    """Check if the shell's process group is the terminal foreground group."""
+    try:
+        with open(f"/proc/{pane_pid}/stat") as f:
+            raw = f.read()
+        cp = raw.rfind(")")
+        rest = raw[cp + 2:].split()
+        pgrp = int(rest[2])
+        tpgid = int(rest[5])
+        return tpgid > 0 and tpgid == pgrp
+    except Exception:
+        return None  # unknown
+
+
+def _capture_bottom(pane_id, n=5):
+    """Capture the last n non-empty lines of a pane."""
+    try:
+        out = _run_tmux(["capture-pane", "-t", pane_id, "-p"], check=True).stdout
+        lines = [l for l in out.splitlines() if l.strip()]
+        return lines[-n:] if lines else []
+    except Exception:
+        return []
+
+
+def _has_prompt(line):
+    """Check if a line looks like a shell prompt."""
+    s = line.rstrip()
+    return any(s.endswith(suffix) for suffix in PROMPT_SUFFIXES)
+
+
+def _ai_state(pane_id, pane_title, fg_cmd):
+    """Determine claude/agent state: ready, busy, or blocked."""
+    bottom = _capture_bottom(pane_id, 10)
+
+    # Check for permission/confirmation prompts first (both claude & agent)
+    for line in bottom:
+        for pat in PERMISSION_PATTERNS:
+            if pat in line:
+                return "blocked"
+
+    cmd_lower = fg_cmd.strip().lstrip("-").lower()
+
+    if cmd_lower == "claude":
+        # Claude: ✳ in title = frozen (done/ready), else busy
+        if CLAUDE_FROZEN in (pane_title or ""):
+            return "ready"
+        return "busy"
+
+    # Agent: check for activity indicators = busy, else ready
+    for line in bottom:
+        if "Generating" in line or "Editing" in line:
+            return "busy"
+    return "ready"
+
+
+def _pane_state(pane_pid, fg_cmd, pane_id, pane_title):
+    """Determine pane state: 'ready', 'busy', or 'blocked'."""
+    cmd_lower = fg_cmd.strip().lstrip("-").lower()
+
+    if cmd_lower in ("claude", "agent"):
+        return _ai_state(pane_id, pane_title, fg_cmd)
+
+    if cmd_lower in VI_COMMANDS:
+        return "vim"
+
+    # Shell: check if shell is foreground process group
+    fg = _shell_is_foreground(pane_pid)
+    if fg is True:
+        return "ready"
+    if fg is False:
+        # Something else is running — check for shell prompt inside (docker/ssh)
+        bottom = _capture_bottom(pane_id, 3)
+        for line in bottom:
+            if _has_prompt(line):
+                return "ready"
+        return "busy"
+
+    # Unknown — fall back to capture-pane
+    bottom = _capture_bottom(pane_id, 3)
+    for line in bottom:
+        if _has_prompt(line):
+            return "ready"
+    return "busy"
+
+
+def _window_info_map():
+    """Get session_name, window_name, window_panes, window_flags, pane_pid, pane_current_command, pane_title."""
+    cmd = ["list-windows", "-a", "-F",
+           "#{window_id}\t#{session_name}\t#{window_name}\t#{window_panes}\t#{window_flags}\t#{pane_pid}\t#{pane_current_command}\t#{pane_id}\t#{pane_title}"]
+    out = _run_tmux(cmd, check=True).stdout
+    info = {}
+    for line in out.splitlines():
+        parts = line.strip().split("\t")
+        if len(parts) >= 4:
+            info[parts[0]] = {
+                "session": parts[1],
+                "name": parts[2],
+                "panes": int(parts[3]) if parts[3].isdigit() else 1,
+                "flags": parts[4] if len(parts) > 4 else "",
+                "pane_pid": parts[5] if len(parts) > 5 else "",
+                "fg_cmd": parts[6] if len(parts) > 6 else "",
+                "pane_id": parts[7] if len(parts) > 7 else "",
+                "pane_title": parts[8] if len(parts) > 8 else "",
+            }
+    return info
+
+
+def _set_pane_status(window_id, symbol):
+    _run_tmux(["set-option", "-w", "-t", window_id, "@pane_status", symbol])
+
+
+def _update_all_statuses():
+    """Recompute and set @pane_status for every window."""
+    win_info = _window_info_map()
+    for window_id, d in win_info.items():
+        state = _pane_state(
+            d.get("pane_pid", ""), d.get("fg_cmd", ""),
+            d.get("pane_id", ""), d.get("pane_title", ""))
+        sym = SYM_VIM if state == "vim" else SYM_READY if state == "ready" else SYM_BLOCKED if state == "blocked" else SYM_BUSY
+        _set_pane_status(window_id, sym)
+
+
+def cmd_choose(target=None, show_all=False):
+    data = load_data()
+    all_window_ids = _list_windows(all_sessions=True)
+    activity = _window_activity_map(all_sessions=True)
+    usage_info = _collect_info(all_window_ids, data, activity)
+    freq_map = _build_freq_map(usage_info, data)
+    win_info = _window_info_map()
+
+    # Sessions with any multi-pane window get a 2-char wider tree prefix
+    sessions_with_expand = set()
+    for d in win_info.values():
+        if d["panes"] > 1:
+            sessions_with_expand.add(d["session"])
+
+    # Set static label (@usage_age) and initial status (@pane_status)
+    for window_id in all_window_ids:
+        freq = freq_map.get(window_id)
+        stats = format_label(freq) if freq is not None else format_unknown()
+        d = win_info.get(window_id, {})
+        name = d.get("name", "?")
+        flags = d.get("flags", "")
+        name_flags = name + flags
+        pad = NAME_PAD - 2 if d.get("session") in sessions_with_expand else NAME_PAD
+        sep = f"#[fg={LABEL_FG}]|#[default]"
+        fg = f"#[fg={LABEL_FG}]"
+        label = f"{name_flags:<{pad}} {sep}{stats} {sep} "
+        _set_window_age(window_id, label)
+
+        state = _pane_state(
+            d.get("pane_pid", ""), d.get("fg_cmd", ""),
+            d.get("pane_id", ""), d.get("pane_title", ""))
+        sym = SYM_VIM if state == "vim" else SYM_READY if state == "ready" else SYM_BLOCKED if state == "blocked" else SYM_BUSY
+        _set_pane_status(window_id, sym)
+
+    fg = f"#[fg={LABEL_FG}]"
+    sep = f"#[fg={LABEL_FG}]|#[default]"
+    fmt = (
+        "#{?pane_format,#{pane_current_command},"
+        "#{?window_format,"
+        "#{@usage_age}" + fg + "#{@pane_status} #[default]" + sep + " #{pane_title}"
+        ",}}"
+    )
+    cmd = ["choose-tree", "-w", "-F", fmt]
+    if not show_all:
+        cmd += ["-f", "#{?#{||:#{m:_*,#{session_name}},#{||:#{m:*_,#{session_name}},#{==:#{session_name},tmux-compose}}},0,1}"]
+    if target:
+        cmd += ["-t", target]
+
+    _run_tmux(cmd)
+def cmd_daemon():
+    """Run as a background daemon, updating @pane_status every second."""
+    interval = 1
+    print(f"tmux-window-usage daemon: polling every {interval}s", flush=True)
+    while True:
+        try:
+            _update_all_statuses()
+        except Exception as e:
+            print(f"tmux-window-usage daemon: error: {e}", flush=True)
+        time.sleep(interval)
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(1)
+    cmd = sys.argv[1]
+    # `daemon` is the long-running systemd service: let it fail loudly so
+    # systemd's Restart=on-failure kicks in. Everything else is invoked from
+    # tmux hooks / keybindings (record, status) or a popup (choose) — an
+    # uncaught exception there (e.g. a fork failure under OOM) would surface as
+    # a tmux "returned 1" error popup. Catch all, log, and exit 0.
+    if cmd == "daemon":
+        cmd_daemon()
+        return
+    try:
+        if cmd == "record":
+            if len(sys.argv) < 3:
+                sys.exit(1)
+            cmd_record(sys.argv[2])
+        elif cmd == "status":
+            if len(sys.argv) < 3:
+                sys.exit(1)
+            cmd_status(sys.argv[2])
+        elif cmd == "choose":
+            args = sys.argv[2:]
+            show_all = "--all" in args
+            remaining = [a for a in args if a != "--all"]
+            target = remaining[0] if remaining else None
+            cmd_choose(target, show_all=show_all)
+        else:
+            sys.exit(1)
+    except SystemExit:
+        raise
+    except BaseException:
+        _log_exc(cmd)
+        sys.exit(0)  # never pop a traceback into tmux
+if __name__ == "__main__":
+    main()
+

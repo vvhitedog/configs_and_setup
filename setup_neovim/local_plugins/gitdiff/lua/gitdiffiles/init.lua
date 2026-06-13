@@ -3,8 +3,9 @@ local M = {}
 local WORKDIR_ID = "WORKDIR"
 
 local config = {
-  log_max = 200,
+  log_max = 0,
   log_view = "oneline",
+  diff_mode = "pr",
   ui = {
     open_in_tab = true,
     file_height = nil,
@@ -17,6 +18,7 @@ local config = {
     set_source = "s",
     set_target = "t",
     toggle_log = "L",
+    toggle_mode = "m",
   },
 }
 
@@ -28,12 +30,43 @@ local state = {
   log_entries = {},
   log_item_by_id = {},
   log_line_map = {},
-  log_full_lines = {},
+  log_graph_short = {},
+  log_graph_full = {},
   log_view = "oneline",
   file_items = {},
+  file_line_map = {},
+  diff_mode = "pr",
+  compare_target = nil,
+  merge_base = nil,
+  base_source = nil,
   buf = { files = nil, log = nil },
   win = { files = nil, log = nil },
   ns = vim.api.nvim_create_namespace("gitdiff"),
+}
+
+local short_hash
+local is_workdir_target
+local ref_label
+local set_ref
+local default_source_from_log
+
+local ANSI_COLOR_GROUP_BY_CODE = {
+  [30] = "GitDiffAnsiBlack",
+  [31] = "GitDiffAnsiRed",
+  [32] = "GitDiffAnsiGreen",
+  [33] = "GitDiffAnsiYellow",
+  [34] = "GitDiffAnsiBlue",
+  [35] = "GitDiffAnsiMagenta",
+  [36] = "GitDiffAnsiCyan",
+  [37] = "GitDiffAnsiWhite",
+  [90] = "GitDiffAnsiBrightBlack",
+  [91] = "GitDiffAnsiBrightRed",
+  [92] = "GitDiffAnsiBrightGreen",
+  [93] = "GitDiffAnsiBrightYellow",
+  [94] = "GitDiffAnsiBrightBlue",
+  [95] = "GitDiffAnsiBrightMagenta",
+  [96] = "GitDiffAnsiBrightCyan",
+  [97] = "GitDiffAnsiBrightWhite",
 }
 
 local function notify(msg, level)
@@ -69,7 +102,197 @@ local function resolve_ref(ref)
   return output[1]
 end
 
-local function short_hash(hash)
+local function commit_ref_from_hash(hash, display)
+  if not hash or hash == "" then
+    return nil
+  end
+  local short = short_hash(hash) or hash:sub(1, 7)
+  return {
+    kind = "commit",
+    spec = hash,
+    hash = hash,
+    short = short,
+    display = display or short,
+  }
+end
+
+local function clone_ref(ref)
+  if not ref then
+    return nil
+  end
+  return vim.deepcopy(ref)
+end
+
+local function normalize_log_max(value)
+  local n = tonumber(value)
+  if not n or n <= 0 then
+    return nil
+  end
+  return math.floor(n)
+end
+
+local function append_log_max(args)
+  local log_max = normalize_log_max(config.log_max)
+  if log_max then
+    table.insert(args, "--max-count")
+    table.insert(args, tostring(log_max))
+  end
+  return args
+end
+
+local function normalize_diff_mode(value)
+  if value == "all" then
+    return "all"
+  end
+  return "pr"
+end
+
+local function apply_ansi_codes(codes, active_group)
+  if codes == nil then
+    return active_group
+  end
+  if codes == "" then
+    return nil
+  end
+
+  local group = active_group
+  for code_text in codes:gmatch("%d+") do
+    local code = tonumber(code_text)
+    if code == 0 or code == 39 then
+      group = nil
+    elseif ANSI_COLOR_GROUP_BY_CODE[code] then
+      group = ANSI_COLOR_GROUP_BY_CODE[code]
+    end
+  end
+  return group
+end
+
+local function strip_ansi_and_collect_spans(raw_line)
+  local out = {}
+  local spans = {}
+  local out_col = 0
+  local idx = 1
+  local active_group = nil
+
+  while idx <= #raw_line do
+    local esc_idx = raw_line:find(string.char(27), idx, true)
+    if not esc_idx then
+      local chunk = raw_line:sub(idx)
+      if chunk ~= "" then
+        table.insert(out, chunk)
+        local start_col = out_col
+        out_col = out_col + #chunk
+        if active_group then
+          table.insert(spans, {
+            hl_group = active_group,
+            start_col = start_col,
+            end_col = out_col,
+          })
+        end
+      end
+      break
+    end
+
+    if esc_idx > idx then
+      local chunk = raw_line:sub(idx, esc_idx - 1)
+      if chunk ~= "" then
+        table.insert(out, chunk)
+        local start_col = out_col
+        out_col = out_col + #chunk
+        if active_group then
+          table.insert(spans, {
+            hl_group = active_group,
+            start_col = start_col,
+            end_col = out_col,
+          })
+        end
+      end
+    end
+
+    local s, e, codes = raw_line:find("\27%[([0-9;]*)m", esc_idx)
+    if s == esc_idx then
+      active_group = apply_ansi_codes(codes, active_group)
+      idx = e + 1
+    else
+      idx = esc_idx + 1
+    end
+  end
+
+  return table.concat(out), spans
+end
+
+local function diff_mode_label(mode)
+  return normalize_diff_mode(mode) == "all" and "ALL" or "PR"
+end
+
+local function next_diff_mode_label()
+  if normalize_diff_mode(state.diff_mode) == "all" then
+    return "PR"
+  end
+  return "ALL"
+end
+
+local function current_target_spec()
+  if is_workdir_target() then
+    return "HEAD"
+  end
+  return state.target and state.target.spec or nil
+end
+
+local function build_compare_target_ref()
+  local spec = current_target_spec()
+  if not spec then
+    return nil
+  end
+  local ref = set_ref(spec)
+  if ref then
+    ref.display = spec
+  end
+  return ref
+end
+
+local function compute_merge_base_ref(source_spec, target_spec)
+  if not source_spec or source_spec == "" or not target_spec or target_spec == "" then
+    return nil
+  end
+  local output = git_cmd({ "merge-base", source_spec, target_spec })
+  if not output or #output == 0 then
+    return nil
+  end
+  return commit_ref_from_hash(output[1])
+end
+
+local function update_compare_refs()
+  state.compare_target = build_compare_target_ref()
+  state.merge_base = nil
+
+  if not state.base_source or not state.base_source.spec then
+    return
+  end
+
+  local target_spec = state.compare_target and state.compare_target.spec
+  if not target_spec then
+    return
+  end
+
+  state.merge_base = compute_merge_base_ref(state.base_source.spec, target_spec)
+end
+
+local function effective_source_ref()
+  if normalize_diff_mode(state.diff_mode) == "all" then
+    return state.source
+  end
+  return state.merge_base or state.base_source or state.source
+end
+
+local function effective_source_kind()
+  if normalize_diff_mode(state.diff_mode) == "all" then
+    return "source"
+  end
+  return "merge-base"
+end
+
+short_hash = function(hash)
   if not hash then
     return nil
   end
@@ -132,16 +355,18 @@ local function setup_window(win, opts)
   end
 end
 
-local function build_log_entries()
+local function build_log_entries(range)
   local entries = {}
-  local output, err = git_cmd({
+  local args = append_log_max({
     "--no-pager",
     "log",
     "--pretty=format:%H%x1f%h%x1f%an%x1f%ad%x1f%s",
     "--date=iso",
-    "--max-count",
-    tostring(config.log_max),
   })
+  if range then
+    table.insert(args, range)
+  end
+  local output, err = git_cmd(args)
   if not output then
     notify(table.concat(err or {}, "\n"), vim.log.levels.ERROR)
     return nil
@@ -166,34 +391,73 @@ local function build_log_entries()
   return entries
 end
 
-local function build_log_full_lines()
-  local output, err = git_cmd({
+local function build_log_graph_lines(view, range)
+  local pretty = "%C(auto)%h %d %s%Creset%x1f%H"
+  if view == "full" then
+    pretty = "%C(auto)%h %d %s%Creset%x1f%H%nAuthor: %an <%ae>%nDate:   %ad%n%n%B"
+  end
+
+  local args = append_log_max({
     "--no-pager",
     "log",
-    "--pretty=medium",
+    "--graph",
+    "--decorate",
+    "--color=always",
+    "--pretty=format:" .. pretty,
     "--date=iso",
-    "--max-count",
-    tostring(config.log_max),
   })
+  if range then
+    table.insert(args, range)
+  end
+  local output, err = git_cmd(args)
   if not output then
     notify(table.concat(err or {}, "\n"), vim.log.levels.ERROR)
     return nil
   end
-  return output
+
+  local rows = {}
+  local current_commit_id = nil
+  for _, raw in ipairs(output) do
+    local visible = raw
+    local commit_id = nil
+
+    local sep = raw:find("\x1f", 1, true)
+    if sep then
+      visible = raw:sub(1, sep - 1)
+      commit_id = raw:sub(sep + 1)
+      if commit_id == "" then
+        commit_id = nil
+      end
+    end
+
+    local text, ansi_spans = strip_ansi_and_collect_spans(visible)
+    if commit_id then
+      current_commit_id = commit_id
+    end
+
+    table.insert(rows, {
+      text = text,
+      commit_id = commit_id or current_commit_id,
+      is_commit_line = commit_id ~= nil,
+      ansi_spans = ansi_spans,
+    })
+  end
+
+  return rows
 end
 
-local function is_workdir_target()
+is_workdir_target = function()
   return state.target and state.target.kind == "workdir"
 end
 
-local function ref_label(ref)
+ref_label = function(ref)
   if not ref then
     return "?"
   end
   if ref.kind == "workdir" then
     return WORKDIR_ID
   end
-  return ref.short or ref.spec or ref.hash or "?"
+  return ref.display or ref.short or ref.spec or ref.hash or "?"
 end
 
 local function marker_for_item(item)
@@ -230,56 +494,72 @@ local function render_log_buffer()
 
   local lines = {}
   local marker_lines = {}
+  local line_highlights = {}
   state.log_line_map = {}
+  local graph_rows = state.log_view == "full" and state.log_graph_full or state.log_graph_short
 
-  if state.log_view == "full" then
-    local line_idx = 1
-    local work_item = state.log_items[1]
-    if work_item then
-      local marker, kind = marker_for_item(work_item)
-      lines[line_idx] = string.format("%-2s %s", marker, work_item.label)
-      state.log_line_map[line_idx] = work_item
-      if kind then
-        marker_lines[line_idx] = kind
-      end
-      line_idx = line_idx + 1
+  local function add_line_highlight(line, hl_group, start_col, end_col)
+    if not line_highlights[line] then
+      line_highlights[line] = {}
+    end
+    table.insert(line_highlights[line], {
+      hl_group = hl_group,
+      start_col = start_col,
+      end_col = end_col,
+    })
+  end
+
+  local line_idx = 1
+  local work_item = state.log_items[1]
+  if work_item then
+    local marker, kind = marker_for_item(work_item)
+    lines[line_idx] = string.format("%-2s %s", marker, work_item.label)
+    state.log_line_map[line_idx] = work_item
+    if kind then
+      marker_lines[line_idx] = kind
+    end
+    line_idx = line_idx + 1
+    if state.log_view == "full" then
       lines[line_idx] = ""
       line_idx = line_idx + 1
     end
+  end
 
-    local current_item = nil
-    for _, raw in ipairs(state.log_full_lines) do
-      local commit_id = raw:match("^commit%s+(%x+)")
-      if commit_id then
-        local item = state.log_item_by_id[commit_id]
-        if item then
-          current_item = item
-          local marker, kind = marker_for_item(item)
-          lines[line_idx] = string.format("%-2s %s", marker, raw)
-          state.log_line_map[line_idx] = item
-          if kind then
-            marker_lines[line_idx] = kind
-          end
-        else
-          lines[line_idx] = "   " .. raw
-        end
-      else
-        lines[line_idx] = "   " .. raw
-        if current_item then
-          state.log_line_map[line_idx] = current_item
-        end
-      end
-      line_idx = line_idx + 1
+  for _, row in ipairs(graph_rows or {}) do
+    local item = nil
+    if row.commit_id then
+      item = state.log_item_by_id[row.commit_id]
     end
-  else
-    for i, item in ipairs(state.log_items) do
-      local marker, kind = marker_for_item(item)
-      lines[i] = string.format("%-2s %s", marker, item.label)
-      state.log_line_map[i] = item
-      if kind then
-        marker_lines[i] = kind
+
+    local marker = " "
+    local kind = nil
+    if item then
+      marker, kind = marker_for_item(item)
+      state.log_line_map[line_idx] = item
+    end
+
+    local text = row.text or ""
+    lines[line_idx] = string.format("%-2s %s", marker, text)
+    if kind then
+      marker_lines[line_idx] = kind
+    end
+
+    if row.ansi_spans then
+      for _, span in ipairs(row.ansi_spans) do
+        add_line_highlight(
+          line_idx,
+          span.hl_group,
+          span.start_col + 3,
+          span.end_col + 3
+        )
       end
     end
+
+    if state.merge_base and row.is_commit_line and row.commit_id == state.merge_base.hash then
+      add_line_highlight(line_idx, "GitDiffMergeBaseMarker", 3, #lines[line_idx])
+    end
+
+    line_idx = line_idx + 1
   end
 
   set_buf_lines(state.buf.log, lines)
@@ -312,6 +592,19 @@ local function render_log_buffer()
         line - 1,
         0,
         1
+      )
+    end
+  end
+
+  for line, highlights in pairs(line_highlights) do
+    for _, highlight in ipairs(highlights) do
+      vim.api.nvim_buf_add_highlight(
+        state.buf.log,
+        state.ns,
+        highlight.hl_group,
+        line - 1,
+        highlight.start_col,
+        highlight.end_col
       )
     end
   end
@@ -355,14 +648,15 @@ local function parse_name_status(lines)
 end
 
 local function build_file_items()
-  if not state.source or not state.source.spec then
+  local source = effective_source_ref()
+  if not source or not source.spec then
     return {}
   end
   local args = { "diff", "--name-status" }
   if is_workdir_target() then
-    table.insert(args, state.source.spec)
+    table.insert(args, source.spec)
   else
-    table.insert(args, state.source.spec .. ".." .. state.target.spec)
+    table.insert(args, source.spec .. ".." .. state.target.spec)
   end
 
   local output, err = git_cmd(args)
@@ -378,14 +672,18 @@ local function render_files_buffer()
     return
   end
   local lines = {}
+  state.file_line_map = {}
   if #state.file_items == 0 then
-    lines = { "No changes" }
+    lines[1] = "No changes"
   else
     for i, item in ipairs(state.file_items) do
-      lines[i] = item.display
+      local line_idx = i
+      lines[line_idx] = item.display
+      state.file_line_map[line_idx] = item
     end
   end
   set_buf_lines(state.buf.files, lines)
+  vim.api.nvim_buf_clear_namespace(state.buf.files, state.ns, 0, -1)
 end
 
 local function winbar_text(title, detail)
@@ -395,17 +693,27 @@ end
 local function update_winbars()
   local source_label = ref_label(state.source)
   local target_label = ref_label(state.target)
+  local baseline = effective_source_ref()
+  local baseline_label = baseline and ref_label(baseline) or "?"
+  local mode_detail = string.format(
+    "mode=%s [%s=%s] %s=%s",
+    diff_mode_label(state.diff_mode),
+    config.keys.toggle_mode,
+    next_diff_mode_label(),
+    effective_source_kind(),
+    baseline_label
+  )
   if state.win.files and vim.api.nvim_win_is_valid(state.win.files) then
     vim.wo[state.win.files].winbar = winbar_text(
       "FILES",
-      string.format("source=%s  target=%s", source_label, target_label)
+      string.format("source=%s  target=%s  %s", source_label, target_label, mode_detail)
     )
   end
   if state.win.log and vim.api.nvim_win_is_valid(state.win.log) then
     local view = state.log_view == "full" and "FULL" or "ONELINE"
     vim.wo[state.win.log].winbar = winbar_text(
       "LOG " .. view,
-      string.format("source=%s  target=%s", source_label, target_label)
+      string.format("source=%s  target=%s  %s", source_label, target_label, mode_detail)
     )
     vim.wo[state.win.log].wrap = state.log_view == "full"
     vim.wo[state.win.log].linebreak = state.log_view == "full"
@@ -413,7 +721,7 @@ local function update_winbars()
   end
 end
 
-local function set_ref(ref)
+set_ref = function(ref)
   local hash = resolve_ref(ref)
   local short = hash and short_hash(hash)
   return {
@@ -421,10 +729,22 @@ local function set_ref(ref)
     spec = ref,
     hash = hash,
     short = short or ref,
+    display = ref,
   }
 end
 
-local function default_source_from_log()
+local function default_source_ref()
+  local candidates = { "origin/HEAD", "origin/main", "origin/master", "main", "master" }
+  for _, candidate in ipairs(candidates) do
+    local ref = set_ref(candidate)
+    if ref and ref.hash then
+      return ref
+    end
+  end
+  return default_source_from_log()
+end
+
+default_source_from_log = function()
   local first_commit = state.log_items[2]
   if first_commit then
     return {
@@ -432,12 +752,14 @@ local function default_source_from_log()
       spec = first_commit.id,
       hash = first_commit.id,
       short = first_commit.short,
+      display = first_commit.short,
     }
   end
   return nil
 end
 
 local function refresh()
+  update_compare_refs()
   local new_entries = build_log_entries()
   if new_entries then
     state.log_entries = new_entries
@@ -453,17 +775,18 @@ local function refresh()
         label = short .. " " .. (entry.subject or ""),
       })
     end
+
     state.log_item_by_id = {}
     for _, item in ipairs(state.log_items) do
       if item.type == "commit" then
         state.log_item_by_id[item.id] = item
       end
     end
-    local full_lines = build_log_full_lines()
-    if full_lines then
-      state.log_full_lines = full_lines
-    end
   end
+
+  state.log_graph_short = build_log_graph_lines("oneline") or {}
+  state.log_graph_full = build_log_graph_lines("full") or {}
+
   state.file_items = build_file_items()
   render_files_buffer()
   render_log_buffer()
@@ -491,7 +814,7 @@ local function get_file_item_at_cursor()
     return nil
   end
   local line = vim.api.nvim_win_get_cursor(state.win.files)[1]
-  return state.file_items[line]
+  return state.file_line_map[line]
 end
 
 local function git_show_lines(ref, path)
@@ -522,15 +845,15 @@ local function open_diff_for_item(item)
     notify("No file selected", vim.log.levels.WARN)
     return
   end
-  if not state.source or not state.source.spec then
+  local source = effective_source_ref()
+  if not source or not source.spec then
     notify("No source commit set", vim.log.levels.ERROR)
     return
   end
 
-  local source_label = state.source.short or state.source.spec
-  local target_label = is_workdir_target() and WORKDIR_ID
-    or (state.target and (state.target.short or state.target.spec))
-  local source_title = "SOURCE " .. source_label
+  local source_label = ref_label(source)
+  local target_label = ref_label(state.target)
+  local source_title = "BASE " .. source_label
   local target_title = "TARGET " .. target_label
 
   local source_path = item.source_path
@@ -548,13 +871,13 @@ local function open_diff_for_item(item)
   vim.api.nvim_win_set_buf(left_win, left_buf)
   setup_window(left_win, { cursorline = false })
   vim.wo[left_win].winbar = winbar_text(
-    "SOURCE " .. source_label,
+    "BASE " .. diff_mode_label(state.diff_mode) .. " " .. source_label,
     source_path or "(missing)"
   )
 
   local left_lines = {}
   if source_path then
-    local lines, err = git_show_lines(state.source.spec, source_path)
+    local lines, err = git_show_lines(source.spec, source_path)
     if lines then
       left_lines = lines
     else
@@ -641,6 +964,23 @@ local function toggle_log_view()
   update_winbars()
 end
 
+local function toggle_diff_mode()
+  if normalize_diff_mode(state.diff_mode) == "all" then
+    state.diff_mode = "pr"
+  else
+    state.diff_mode = "all"
+  end
+  refresh()
+  notify(
+    string.format(
+      "Diff mode: %s (press %s to switch to %s)",
+      diff_mode_label(state.diff_mode),
+      config.keys.toggle_mode,
+      next_diff_mode_label()
+    )
+  )
+end
+
 local function set_keymaps()
   if state.buf.files then
     vim.keymap.set("n", config.keys.open, open_diff_for_item, {
@@ -654,6 +994,11 @@ local function set_keymaps()
       silent = true,
     })
     vim.keymap.set("n", config.keys.quit, close_ui, {
+      buffer = state.buf.files,
+      nowait = true,
+      silent = true,
+    })
+    vim.keymap.set("n", config.keys.toggle_mode, toggle_diff_mode, {
       buffer = state.buf.files,
       nowait = true,
       silent = true,
@@ -675,6 +1020,7 @@ local function set_keymaps()
         spec = item.id,
         hash = item.id,
         short = item.short,
+        display = item.short,
       }
       refresh()
     end, {
@@ -696,6 +1042,7 @@ local function set_keymaps()
           spec = item.id,
           hash = item.id,
           short = item.short,
+          display = item.short,
         }
       end
       refresh()
@@ -711,6 +1058,11 @@ local function set_keymaps()
       silent = true,
     })
     vim.keymap.set("n", config.keys.toggle_log, toggle_log_view, {
+      buffer = state.buf.log,
+      nowait = true,
+      silent = true,
+    })
+    vim.keymap.set("n", config.keys.toggle_mode, toggle_diff_mode, {
       buffer = state.buf.log,
       nowait = true,
       silent = true,
@@ -755,6 +1107,7 @@ end
 
 function M.setup(opts)
   config = vim.tbl_deep_extend("force", config, opts or {})
+  config.diff_mode = normalize_diff_mode(config.diff_mode)
   if config.ui and config.ui.open_in_tab ~= nil then
     local v = config.ui.open_in_tab
     if v == 0 or v == "0" or v == "false" then
@@ -798,23 +1151,26 @@ function M.open(opts)
       state.log_item_by_id[item.id] = item
     end
   end
-  state.log_full_lines = build_log_full_lines() or {}
+  state.log_graph_short = build_log_graph_lines("oneline") or {}
+  state.log_graph_full = build_log_graph_lines("full") or {}
   state.log_view = config.log_view == "full" and "full" or "oneline"
+  state.diff_mode = normalize_diff_mode(config.diff_mode)
 
   if opts.source and opts.source ~= "" then
     state.source = set_ref(opts.source)
     if not state.source.hash then
       notify("Invalid source ref: " .. opts.source, vim.log.levels.WARN)
-      state.source = default_source_from_log()
+      state.source = default_source_ref()
     end
   else
-    state.source = default_source_from_log()
+    state.source = default_source_ref()
   end
 
   if not state.source then
     notify("Unable to determine source commit", vim.log.levels.ERROR)
     return
   end
+  state.base_source = clone_ref(state.source)
 
   local target = opts.target
   local target_upper = target and target:upper() or ""

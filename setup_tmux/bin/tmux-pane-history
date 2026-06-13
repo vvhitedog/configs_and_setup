@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""Tmux pane scrollback history capture daemon and viewer."""
+
+import argparse
+import difflib
+import hashlib
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+
+DB_PATH = os.path.expanduser("~/.cache/tmux/pane-history.db")
+POLL_INTERVAL = 5
+PRUNE_AGE_DAYS = 30
+PRUNE_CHECK_INTERVAL = 3600  # 1 hour
+
+
+def get_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS captures (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            pane_id     TEXT NOT NULL,
+            session     TEXT NOT NULL,
+            window_idx  TEXT NOT NULL,
+            pane_idx    TEXT NOT NULL,
+            captured_at INTEGER NOT NULL,
+            content     TEXT NOT NULL,
+            hash        TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_captures_pane_time
+        ON captures(pane_id, captured_at DESC)
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS merged (
+            pane_id         TEXT PRIMARY KEY,
+            content         TEXT NOT NULL,
+            last_capture_id INTEGER NOT NULL
+        )
+    """)
+    # Add optional label column (migration for existing DBs)
+    try:
+        conn.execute("ALTER TABLE merged ADD COLUMN label TEXT")
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    conn.commit()
+    return conn
+
+
+def get_last_hash(conn, pane_id):
+    row = conn.execute(
+        "SELECT hash FROM captures WHERE pane_id = ? ORDER BY captured_at DESC LIMIT 1",
+        (pane_id,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def list_panes():
+    result = subprocess.run(
+        ["tmux", "list-panes", "-a", "-F",
+         "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_pid}"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return []
+    panes = []
+    for line in result.stdout.strip().splitlines():
+        parts = line.split("\t")
+        if len(parts) == 5:
+            panes.append(parts)
+    return panes
+
+
+def make_terminal_key(pane_id, pane_pid):
+    """Unique key for a pane lifecycle — pane_pid changes when pane is recycled."""
+    return f"{pane_id}@{pane_pid}"
+
+
+def capture_pane(pane_id):
+    result = subprocess.run(
+        ["tmux", "capture-pane", "-t", pane_id, "-p", "-e", "-J", "-S", "-", "-E", "-"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def prune_old(conn):
+    cutoff = int(time.time()) - PRUNE_AGE_DAYS * 86400
+    conn.execute("DELETE FROM captures WHERE captured_at < ?", (cutoff,))
+    conn.commit()
+
+
+def daemon():
+    print(f"tmux-pane-history daemon started, db={DB_PATH}", flush=True)
+    conn = get_db()
+    last_prune = 0
+
+    while True:
+        now = int(time.time())
+
+        # Auto-prune once per hour
+        if now - last_prune >= PRUNE_CHECK_INTERVAL:
+            prune_old(conn)
+            last_prune = now
+
+        for pane_id, session, win_idx, pane_idx, pane_pid in list_panes():
+            content = capture_pane(pane_id)
+            if content is None:
+                continue
+
+            tkey = make_terminal_key(pane_id, pane_pid)
+            h = hashlib.sha256(content.encode()).hexdigest()
+            if h == get_last_hash(conn, tkey):
+                continue
+
+            conn.execute(
+                "INSERT INTO captures (pane_id, session, window_idx, pane_idx, captured_at, content, hash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (tkey, session, win_idx, pane_idx, now, content, h),
+            )
+            conn.commit()
+            update_merged_cache(conn, tkey)
+
+        time.sleep(POLL_INTERVAL)
+
+
+_VT100_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f]")
+
+
+def strip_vt100_controls(text):
+    """Remove VT100 control chars (shift-out/in etc.) but keep ANSI escape sequences."""
+    return _VT100_CTRL_RE.sub("", text)
+
+
+def strip_trailing_blanks(lines):
+    """Remove trailing empty/whitespace-only lines."""
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines
+
+
+def merge_captures(contents):
+    """Merge sequential scrollback captures into one continuous history.
+
+    Each capture is the full scrollback at that moment. Between captures,
+    new lines appear at the bottom and old lines may fall off the top.
+    Uses SequenceMatcher to find the longest common block between the tail
+    of the accumulated result and the head of each new capture, then splices
+    them: accumulated history before the overlap + new capture from the overlap
+    onward.
+    """
+    if not contents:
+        return ""
+
+    result = strip_trailing_blanks(contents[0].splitlines())
+
+    for content in contents[1:]:
+        new_lines = strip_trailing_blanks(content.splitlines())
+        if not new_lines:
+            continue
+
+        # Only diff the tail of result against new_lines — the overlap must be
+        # in the most recent portion of result (at most 2x scrollback size).
+        tail_size = min(len(result), len(new_lines) * 2)
+        tail_offset = len(result) - tail_size
+        tail = result[tail_offset:]
+
+        sm = difflib.SequenceMatcher(None, tail, new_lines, autojunk=False)
+        match = sm.find_longest_match(0, len(tail), 0, len(new_lines))
+
+        if match.size > 0:
+            # match.a = start in tail, match.b = start in new_lines
+            # Keep result up to where the overlap starts, then append
+            # new_lines from the overlap onward (which includes the overlap
+            # itself plus everything new after it).
+            cut = tail_offset + match.a
+            result = result[:cut] + new_lines[match.b:]
+        else:
+            result.extend(new_lines)
+
+    return "\n".join(result)
+
+
+def merge_two(accumulated, new_content):
+    """Merge a single new capture into the accumulated result."""
+    result = strip_trailing_blanks(accumulated.splitlines())
+    new_lines = strip_trailing_blanks(new_content.splitlines())
+    if not new_lines:
+        return "\n".join(result)
+
+    tail_size = min(len(result), len(new_lines) * 2)
+    tail_offset = len(result) - tail_size
+    tail = result[tail_offset:]
+
+    sm = difflib.SequenceMatcher(None, tail, new_lines, autojunk=False)
+    match = sm.find_longest_match(0, len(tail), 0, len(new_lines))
+
+    if match.size > 0:
+        cut = tail_offset + match.a
+        result = result[:cut] + new_lines[match.b:]
+    else:
+        result.extend(new_lines)
+
+    return "\n".join(result)
+
+
+def update_merged_cache(conn, pane_id):
+    """Incrementally merge any new captures since last cached merge."""
+    # Get the latest label from captures
+    label_row = conn.execute(
+        "SELECT session, window_idx, pane_idx FROM captures "
+        "WHERE pane_id = ? ORDER BY captured_at DESC LIMIT 1",
+        (pane_id,),
+    ).fetchone()
+    label = f"{label_row[0]}:{label_row[1]}.{label_row[2]}" if label_row else None
+
+    row = conn.execute(
+        "SELECT content, last_capture_id FROM merged WHERE pane_id = ?",
+        (pane_id,),
+    ).fetchone()
+
+    if row:
+        cached_content, last_id = row
+        new_rows = conn.execute(
+            "SELECT id, content FROM captures WHERE pane_id = ? AND id > ? ORDER BY id ASC",
+            (pane_id, last_id),
+        ).fetchall()
+        if not new_rows:
+            # Still update label even if no new content
+            if label:
+                conn.execute(
+                    "UPDATE merged SET label = ? WHERE pane_id = ?",
+                    (label, pane_id),
+                )
+                conn.commit()
+            return cached_content
+        for cap_id, content in new_rows:
+            cached_content = merge_two(cached_content, content)
+            last_id = cap_id
+        conn.execute(
+            "UPDATE merged SET content = ?, last_capture_id = ?, label = ? WHERE pane_id = ?",
+            (cached_content, last_id, label, pane_id),
+        )
+    else:
+        all_rows = conn.execute(
+            "SELECT id, content FROM captures WHERE pane_id = ? ORDER BY id ASC",
+            (pane_id,),
+        ).fetchall()
+        if not all_rows:
+            return ""
+
+        # Seed from old-format merged entry if this is a new-format key (%X@pid)
+        # and there's legacy data under the bare pane_id (%X)
+        seed_content = ""
+        if "@" in pane_id:
+            bare_id = pane_id.split("@")[0]
+            old_row = conn.execute(
+                "SELECT content FROM merged WHERE pane_id = ?", (bare_id,)
+            ).fetchone()
+            if old_row:
+                seed_content = old_row[0]
+
+        if seed_content:
+            cached_content = seed_content
+            for cap_id, content in all_rows:
+                cached_content = merge_two(cached_content, content)
+        else:
+            cached_content = merge_captures([r[1] for r in all_rows])
+
+        last_id = all_rows[-1][0]
+        conn.execute(
+            "INSERT INTO merged (pane_id, content, last_capture_id, label) VALUES (?, ?, ?, ?)",
+            (pane_id, cached_content, last_id, label),
+        )
+
+    conn.commit()
+    return cached_content
+
+
+def resolve_terminal_key(pane_id):
+    """Resolve a live tmux pane_id to its terminal key (pane_id@pane_pid)."""
+    info = subprocess.run(
+        ["tmux", "list-panes", "-a", "-F",
+         "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_pid}",
+         "-f", "#{==:#{pane_id}," + pane_id + "}"],
+        capture_output=True, text=True,
+    )
+    if info.returncode != 0 or not info.stdout.strip():
+        return None, None, None, None, None
+    parts = info.stdout.strip().split("\t")
+    if len(parts) != 5:
+        return None, None, None, None, None
+    _, session, win_idx, pane_idx, pane_pid = parts
+    tkey = make_terminal_key(pane_id, pane_pid)
+    return tkey, session, win_idx, pane_idx, pane_pid
+
+
+def capture_one(conn, pane_id):
+    """Capture a single pane's current scrollback into the DB."""
+    tkey, session, win_idx, pane_idx, pane_pid = resolve_terminal_key(pane_id)
+    if tkey is None:
+        return None
+
+    content = capture_pane(pane_id)
+    if content is None:
+        return tkey
+
+    h = hashlib.sha256(content.encode()).hexdigest()
+    if h == get_last_hash(conn, tkey):
+        return tkey
+
+    conn.execute(
+        "INSERT INTO captures (pane_id, session, window_idx, pane_idx, captured_at, content, hash) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (tkey, session, win_idx, pane_idx, int(time.time()), content, h),
+    )
+    conn.commit()
+    return tkey
+
+
+def view(pane_id):
+    conn = get_db()
+
+    # Grab the latest scrollback before displaying
+    tkey = capture_one(conn, pane_id)
+
+    if not tkey:
+        conn.close()
+        print(f"No history found for pane {pane_id}")
+        sys.exit(1)
+
+    row = conn.execute(
+        "SELECT session, window_idx, pane_idx FROM captures WHERE pane_id = ? "
+        "ORDER BY captured_at DESC LIMIT 1",
+        (tkey,),
+    ).fetchone()
+
+    if not row:
+        conn.close()
+        print(f"No history found for pane {pane_id}")
+        sys.exit(1)
+
+    label = f"{row[0]}:{row[1]}.{row[2]}"
+    merged = update_merged_cache(conn, tkey)
+
+    conn.close()
+
+    fd, tmpfile = tempfile.mkstemp(suffix=".txt", prefix="pane-history-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(strip_vt100_controls(merged))
+        subprocess.run([
+            "nvim",
+            "-c", "set nowrap",
+            "-c", "lua local b = require('baleia').setup({async = false}); b.once(vim.api.nvim_get_current_buf()); vim.bo.modifiable = false; vim.bo.buftype = 'nofile'",
+            "-c", "set statusline=\\ pane-history\\ " + label,
+            "-c", "set laststatus=2",
+            "-c", "normal G",
+            tmpfile,
+        ])
+    finally:
+        os.unlink(tmpfile)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Tmux pane scrollback history")
+    sub = parser.add_subparsers(dest="command")
+
+    sub.add_parser("daemon", help="Run capture daemon")
+
+    view_parser = sub.add_parser("view", help="View pane history in nvim")
+    view_parser.add_argument("pane_id", help="Tmux pane ID (e.g. %%5)")
+
+    cap_parser = sub.add_parser("capture", help="Capture one pane and update merged cache")
+    cap_parser.add_argument("pane_id", help="Tmux pane ID (e.g. %%5)")
+
+    args = parser.parse_args()
+    if args.command == "daemon":
+        daemon()
+    elif args.command == "view":
+        view(args.pane_id)
+    elif args.command == "capture":
+        conn = get_db()
+        tkey = capture_one(conn, args.pane_id)
+        if tkey:
+            update_merged_cache(conn, tkey)
+        conn.close()
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

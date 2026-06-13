@@ -1,0 +1,9 @@
+#!/bin/sh
+# Thin wrapper: runs tmux-jumplist, then switches client if target was set
+JT="$HOME/.cache/tmux/compose-state/jt"
+rm -f "$JT"
+"$HOME/.local/bin/tmux-jumplist" "$@"
+if [ -f "$JT" ]; then
+    tmux switch-client -t "$(cat "$JT")"
+    rm -f "$JT"
+fi

@@ -1,13 +1,24 @@
 [global_config]
   focus = system
   suppress_multiple_term_dialog = True
-  title_transmit_bg_color = "#d30102"
 [keybindings]
-  broadcast_all = None
-  broadcast_group = None
   broadcast_off = None
-  help = <Primary>F1
+  broadcast_group = None
+  broadcast_all = None
   layout_launcher = <Primary><Alt>l
+  help = <Primary>F1
+[profiles]
+  [[default]]
+    background_color = "#1e2127"
+    cursor_fg_color = "#1e2127"
+    cursor_bg_color = "#abb2bf"
+    font = SauceCodePro Nerd Font 14
+    foreground_color = "#abb2bf"
+    show_titlebar = False
+    palette = "#1e2127:#e06c75:#98c379:#e5c07b:#61afef:#c678dd:#56b6c2:#abb2bf:#5c6370:#e06c75:#98c379:#e5c07b:#61afef:#c678dd:#56b6c2:#ffffff"
+    use_system_font = False
+    title_transmit_fg_color = "#20232a"
+    title_transmit_bg_color = "#7a9c61"
 [layouts]
   [[default]]
     [[[child1]]]
@@ -18,11 +29,3 @@
       parent = ""
       type = Window
 [plugins]
-[profiles]
-  [[default]]
-    background_color = "#3f3f3f"
-    cursor_color = "#dcdcdc"
-    font = SauceCodePro Nerd Font 14
-    foreground_color = "#dcdcdc"
-    palette = "#3f3f3f:#cc9393:#7f9f7f:#e3ceab:#dfaf8f:#cc9393:#8cd0d3:#dcdccc:#3f3f3f:#cc9393:#7f9f7f:#e3ceab:#dfaf8f:#cc9393:#8cd0d3:#dcdccc"
-    use_system_font = False

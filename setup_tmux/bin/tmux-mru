@@ -1,0 +1,1364 @@
+#!/usr/bin/env python3
+"""Tmux MRU — most recently used terminal picker with frequency-weighted stickiness."""
+
+import hashlib
+import json
+import math
+import os
+import subprocess
+import sqlite3
+import sys
+import time
+import traceback
+
+DB_PATH = os.path.expanduser("~/.cache/tmux/pane-history.db")
+LOG_PATH = os.path.expanduser("~/.cache/tmux/tmux-mru.log")
+
+
+def _log_exc(cmd):
+    """Append a timestamped traceback to the log. Best-effort; never raises."""
+    try:
+        os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+        with open(LOG_PATH, "a") as f:
+            f.write("\n=== %s  cmd=%s ===\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), cmd))
+            f.write(traceback.format_exc())
+    except OSError:
+        pass
+STATE_DIR = os.path.expanduser("~/.cache/tmux/compose-state")
+MODE_PREF_FILE = os.path.join(STATE_DIR, "mru_default_mode")
+PRUNE_DAYS = 30
+
+
+def get_db():
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS mru (
+            pane_id TEXT NOT NULL,
+            pane_pid TEXT NOT NULL,
+            session TEXT NOT NULL,
+            window_idx TEXT NOT NULL,
+            pane_idx TEXT NOT NULL,
+            window_name TEXT NOT NULL,
+            visit_count INTEGER NOT NULL DEFAULT 1,
+            last_visit INTEGER NOT NULL,
+            first_visit INTEGER NOT NULL,
+            snapshot_lines INTEGER DEFAULT 0,
+            snapshot_hash TEXT DEFAULT '',
+            PRIMARY KEY (pane_id, pane_pid)
+        )
+    """)
+    # Migration: add snapshot columns if missing
+    try:
+        conn.execute("ALTER TABLE mru ADD COLUMN snapshot_lines INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE mru ADD COLUMN snapshot_hash TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+    conn.commit()
+    return conn
+
+
+def get_live_panes():
+    try:
+        out = subprocess.check_output(
+            ["tmux", "list-panes", "-a", "-F",
+             "#{pane_id}\t#{pane_pid}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{window_name}"],
+            text=True,
+        )
+        result = {}
+        for line in out.strip().splitlines():
+            parts = line.split("\t")
+            if len(parts) == 6:
+                result[parts[0]] = {
+                    "pid": parts[1],
+                    "session": parts[2],
+                    "window_idx": parts[3],
+                    "pane_idx": parts[4],
+                    "window_name": parts[5],
+                }
+        return result
+    except (subprocess.CalledProcessError, OSError):
+        # OSError covers fork failures (ENOMEM) under memory pressure.
+        return {}
+
+
+def get_pane_info(pane_id):
+    try:
+        out = subprocess.check_output(
+            ["tmux", "display-message", "-t", pane_id, "-p",
+             "#{pane_id}\t#{pane_pid}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{window_name}"],
+            text=True,
+        ).strip()
+        parts = out.split("\t")
+        if len(parts) == 6:
+            return {
+                "pane_id": parts[0], "pane_pid": parts[1],
+                "session": parts[2], "window_idx": parts[3],
+                "pane_idx": parts[4], "window_name": parts[5],
+            }
+    except (subprocess.CalledProcessError, OSError):
+        # OSError covers fork failures (ENOMEM) under memory pressure.
+        pass
+    return None
+
+
+def mru_score(visit_count, last_visit, now):
+    """Pure MRU ordering — most recently used first."""
+    return last_visit
+
+
+LAST_PANE_FILE = os.path.join(STATE_DIR, "mru_last_pane")
+
+
+def snapshot_pane(conn, pane_id):
+    """Capture current scrollback line count + hash for a pane and store as snapshot."""
+    try:
+        out = subprocess.check_output(
+            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-"],
+            text=True, timeout=2,
+        )
+        lines = out.rstrip("\n").split("\n")
+        line_count = len(lines)
+        # Hash last 50 lines (captures recent activity, ignores ancient history)
+        tail = "\n".join(lines[-50:])
+        snap_hash = hashlib.sha256(tail.encode()).hexdigest()[:16]
+
+        # Get pane info to find the DB key
+        info = get_pane_info(pane_id)
+        if info:
+            conn.execute(
+                "UPDATE mru SET snapshot_lines = ?, snapshot_hash = ? "
+                "WHERE pane_id = ? AND pane_pid = ?",
+                (line_count, snap_hash, info["pane_id"], info["pane_pid"]),
+            )
+            conn.commit()
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError,
+            sqlite3.Error):
+        pass
+
+
+def get_pane_activity(pane_id, snapshot_lines, snapshot_hash):
+    """Compare current scrollback against snapshot. Returns (symbol, description).
+    Uses ASCII-only symbols to avoid UTF-8 byte offset issues in nvim highlights."""
+    try:
+        out = subprocess.check_output(
+            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-"],
+            text=True, timeout=2,
+        )
+        lines = out.rstrip("\n").split("\n")
+        current_lines = len(lines)
+        tail = "\n".join(lines[-50:])
+        current_hash = hashlib.sha256(tail.encode()).hexdigest()[:16]
+
+        if current_hash == snapshot_hash:
+            return "-", "no change"
+
+        line_diff = abs(current_lines - snapshot_lines)
+        if line_diff <= 2:
+            return ".", "minor"
+        elif line_diff <= 20:
+            return "+", f"+{line_diff}"
+        elif line_diff <= 100:
+            return "++", f"+{line_diff}"
+        else:
+            return "+++", f"+{line_diff}"
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        return "?", "unknown"
+
+
+def cmd_record(pane_id):
+    """Record a pane visit — upsert into MRU table. Snapshot the pane we're leaving."""
+    info = get_pane_info(pane_id)
+    if not info:
+        return
+    # Skip tmux-compose and _ prefixed session panes
+    if info["session"].startswith("_") or info["session"] == "tmux-compose":
+        return
+
+    now = int(time.time())
+    conn = get_db()
+
+    # Snapshot the pane we're leaving (the previous pane)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if os.path.exists(LAST_PANE_FILE):
+        with open(LAST_PANE_FILE) as f:
+            prev_pane = f.read().strip()
+        if prev_pane and prev_pane != pane_id:
+            snapshot_pane(conn, prev_pane)
+
+    # Write current pane as "last pane"
+    with open(LAST_PANE_FILE, "w") as f:
+        f.write(pane_id)
+
+    row = conn.execute(
+        "SELECT visit_count FROM mru WHERE pane_id = ? AND pane_pid = ?",
+        (info["pane_id"], info["pane_pid"]),
+    ).fetchone()
+
+    if row:
+        conn.execute(
+            "UPDATE mru SET session = ?, window_idx = ?, window_name = ?, "
+            "visit_count = visit_count + 1, last_visit = ? "
+            "WHERE pane_id = ? AND pane_pid = ?",
+            (info["session"], info["window_idx"], info["window_name"],
+             now, info["pane_id"], info["pane_pid"]),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO mru (pane_id, pane_pid, session, window_idx, pane_idx, "
+            "window_name, visit_count, last_visit, first_visit) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (info["pane_id"], info["pane_pid"], info["session"],
+             info["window_idx"], info["pane_idx"], info["window_name"],
+             now, now),
+        )
+
+    # Prune very old entries
+    cutoff = now - PRUNE_DAYS * 86400
+    conn.execute("DELETE FROM mru WHERE last_visit < ?", (cutoff,))
+
+    conn.commit()
+    conn.close()
+
+
+def build_mru_items(with_activity=False, source_pane=None):
+    """Shared: query DB, filter to live panes, compute scores + optional activity."""
+    conn = get_db()
+    live = get_live_panes()
+    now = int(time.time())
+
+    # Snapshot the pane we just came from so its activity shows as "no change"
+    if source_pane and with_activity:
+        snapshot_pane(conn, source_pane)
+
+    rows = conn.execute(
+        "SELECT pane_id, pane_pid, session, window_idx, pane_idx, "
+        "window_name, visit_count, last_visit, snapshot_lines, snapshot_hash FROM mru"
+    ).fetchall()
+    conn.close()
+
+    items = []
+    for pane_id, pane_pid, session, window_idx, pane_idx, window_name, visits, last_visit, snap_lines, snap_hash in rows:
+        if pane_id not in live:
+            continue
+        lp = live[pane_id]
+        if lp["pid"] != pane_pid or lp["session"] != session:
+            continue
+        score = mru_score(visits, last_visit, now)
+        age = now - last_visit
+        item = {
+            "pane_id": pane_id,
+            "pane_pid": pane_pid,
+            "target": f"{lp['session']}:{lp['window_idx']}.{lp['pane_idx']}",
+            "session": lp["session"],
+            "window_idx": lp["window_idx"],
+            "pane_idx": lp["pane_idx"],
+            "window_name": lp["window_name"],
+            "visits": visits,
+            "age": format_age(age),
+            "score": score,
+            "activity": "-",
+            "activity_desc": "",
+        }
+        if with_activity:
+            item["activity"], item["activity_desc"] = get_pane_activity(
+                pane_id, snap_lines or 0, snap_hash or "")
+        items.append(item)
+
+    items.sort(key=lambda x: x["score"], reverse=True)
+
+    # Show one row per tmux window. If a window has multiple panes, keep the
+    # pane with the newest MRU score so the picker stays compact without losing
+    # the most likely target for that window.
+    deduped = []
+    seen_windows = set()
+    for item in items:
+        window_key = (item["session"], item["window_idx"])
+        if window_key in seen_windows:
+            continue
+        seen_windows.add(window_key)
+        deduped.append(item)
+    return deduped
+
+
+def cmd_regenerate():
+    """Regenerate all MRU data files from the DB (called after delete)."""
+    items = build_mru_items(with_activity=False)
+
+    # Rewrite tail files
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tails_dir = os.path.join(STATE_DIR, "mru_tails")
+    if os.path.exists(tails_dir):
+        import shutil
+        shutil.rmtree(tails_dir)
+    os.makedirs(tails_dir)
+
+    for i, item in enumerate(items):
+        tail = get_pane_history_tail(item["pane_id"], item["pane_pid"])
+        tail_path = os.path.join(tails_dir, f"{i}.txt")
+        with open(tail_path, "w") as f:
+            f.write(tail)
+        item["tail_path"] = tail_path
+
+    if not items:
+        return
+
+    from collections import OrderedDict
+
+    COL_SESSION = max(10, max(len(i["session"]) for i in items) + 1)
+    COL_WINDOW = max(10, max(len(i["window_name"]) for i in items) + 1)
+    COL_VISITS = 6
+    COL_AGE = 6
+    COL_ACTIVITY = 8
+
+    header = f" {'Session'.ljust(COL_SESSION)}  {'Window'.ljust(COL_WINDOW)}  {'Visits'.rjust(COL_VISITS)}  {'Last'.rjust(COL_AGE)}    {'Δ'.ljust(COL_ACTIVITY)}"
+    separator = " " + "─" * (COL_SESSION + COL_WINDOW + COL_VISITS + COL_AGE + COL_ACTIVITY + 11)
+
+    # Flat
+    flat_lines = [header, separator]
+    flat_data = [None, None]
+    for item in items:
+        line = f" {item['session'].ljust(COL_SESSION)}  {item['window_name'].ljust(COL_WINDOW)}  {str(item['visits']).rjust(COL_VISITS)}  {item['age'].rjust(COL_AGE)}    {item.get('activity', '-').ljust(COL_ACTIVITY)}"
+        flat_lines.append(line)
+        flat_data.append(item)
+
+    # Grouped
+    groups = OrderedDict()
+    for item in items:
+        s = item["session"]
+        if s not in groups:
+            groups[s] = []
+        groups[s].append(item)
+
+    grouped_lines = [header, separator]
+    grouped_data = [None, None]
+    grouped_non_sel = {0, 1}
+    grouped_headers = []
+    for session_name, session_items in groups.items():
+        grouped_lines.append(f" ┌ {session_name}")
+        grouped_data.append(None)
+        grouped_non_sel.add(len(grouped_lines) - 1)
+        grouped_headers.append(len(grouped_lines) - 1)
+        for item in session_items:
+            line = f" │ {''.ljust(COL_SESSION)}{item['window_name'].ljust(COL_WINDOW)}  {str(item['visits']).rjust(COL_VISITS)}  {item['age'].rjust(COL_AGE)}    {item.get('activity', '-').ljust(COL_ACTIVITY)}"
+            grouped_lines.append(line)
+            grouped_data.append(item)
+        grouped_lines.append(f" └{'─' * (COL_SESSION + COL_WINDOW + COL_VISITS + COL_AGE + COL_ACTIVITY + 9)}")
+        grouped_data.append(None)
+        grouped_non_sel.add(len(grouped_lines) - 1)
+
+    grouped_display_items = [d for d in grouped_data if d is not None]
+
+    # Write files
+    with open(os.path.join(STATE_DIR, "mru_picker.json"), "w") as f:
+        json.dump(items, f, default=str)
+    with open(os.path.join(STATE_DIR, "mru_grouped.json"), "w") as f:
+        json.dump({"items": grouped_display_items, "non_sel": sorted(grouped_non_sel), "group_headers": grouped_headers}, f, default=str)
+    with open(os.path.join(STATE_DIR, "mru_display.txt"), "w") as f:
+        f.write("\n".join(flat_lines))
+    with open(os.path.join(STATE_DIR, "mru_grouped.txt"), "w") as f:
+        f.write("\n".join(grouped_lines))
+
+
+def cmd_refresh_activity():
+    """Recompute activity for all MRU items, write to a JSON file."""
+    conn = get_db()
+    live = get_live_panes()
+    rows = conn.execute(
+        "SELECT pane_id, pane_pid, session, snapshot_lines, snapshot_hash FROM mru"
+    ).fetchall()
+    conn.close()
+
+    results = {}
+    for pane_id, pane_pid, session, snap_lines, snap_hash in rows:
+        if pane_id not in live:
+            continue
+        lp = live[pane_id]
+        if lp["pid"] != pane_pid or lp["session"] != session:
+            continue
+        sym, desc = get_pane_activity(pane_id, snap_lines or 0, snap_hash or "")
+        results[f"{pane_id}@{pane_pid}"] = sym
+
+    out_path = os.path.join(STATE_DIR, "mru_activity.json")
+    with open(out_path, "w") as f:
+        json.dump(results, f)
+
+
+def cmd_refresh_tail(pane_id, pane_pid, tail_path):
+    """Re-generate a tail file from the DB for a specific pane."""
+    tail = get_pane_history_tail(pane_id, pane_pid)
+    with open(tail_path, "w") as f:
+        f.write(tail)
+
+
+def cmd_delete(pane_id, pane_pid):
+    """Delete a terminal from the MRU list."""
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM mru WHERE pane_id = ? AND pane_pid = ?",
+        (pane_id, pane_pid),
+    )
+    conn.commit()
+    conn.close()
+
+
+def format_age(seconds):
+    if seconds < 60:
+        return f"{seconds}s"
+    elif seconds < 3600:
+        return f"{seconds // 60}m"
+    elif seconds < 86400:
+        return f"{seconds // 3600}h"
+    return f"{seconds // 86400}d"
+
+
+def get_pane_history_tail(pane_id, pane_pid, max_lines=200):
+    """Get last N lines of a pane's terminal history for preview."""
+    import re as _re
+    tkey = f"{pane_id}@{pane_pid}"
+    try:
+        # Try to import from tmux-compose's DB access
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA journal_mode=WAL")
+        row = conn.execute(
+            "SELECT content FROM merged WHERE pane_id = ?", (tkey,)
+        ).fetchone()
+        if not row:
+            # Try bare pane_id
+            row = conn.execute(
+                "SELECT content FROM merged WHERE pane_id = ?", (pane_id,)
+            ).fetchone()
+        conn.close()
+        if row:
+            content = row[0]
+            # Strip VT100 controls
+            content = _re.sub(r"[\x0e\x0f]", "", content)
+            lines = content.split("\n")
+            if len(lines) > max_lines:
+                lines = lines[-max_lines:]
+            return "\n".join(lines)
+    except Exception:
+        pass
+    return ""
+
+
+def cmd_pick():
+    """Open MRU picker in nvim with preview split."""
+    # Read the last pane the user was in, snapshot it so it shows "no change"
+    source_pane = None
+    if os.path.exists(LAST_PANE_FILE):
+        with open(LAST_PANE_FILE) as f:
+            source_pane = f.read().strip() or None
+    items = build_mru_items(with_activity=True, source_pane=source_pane)
+    if not items:
+        return
+
+    # Write tail previews
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tails_dir = os.path.join(STATE_DIR, "mru_tails")
+    if os.path.exists(tails_dir):
+        import shutil
+        shutil.rmtree(tails_dir)
+    os.makedirs(tails_dir)
+
+    for i, item in enumerate(items):
+        tail = get_pane_history_tail(item["pane_id"], item["pane_pid"])
+        tail_path = os.path.join(tails_dir, f"{i}.txt")
+        with open(tail_path, "w") as f:
+            f.write(tail)
+        item["tail_path"] = tail_path
+
+    # Cap session/window display widths so one long name can't blow up the
+    # whole table. Use ASCII "..." so byte count == char count and the
+    # byte-offset highlighting code in Lua stays correct.
+    MAX_SESSION = 24
+    MAX_WINDOW = 30
+
+    def _trunc(s, n):
+        return s if len(s) <= n else s[: n - 3] + "..."
+
+    for item in items:
+        item["session"] = _trunc(item["session"], MAX_SESSION)
+        item["window_name"] = _trunc(item["window_name"], MAX_WINDOW)
+
+    # Column widths
+    COL_SESSION = max(10, max(len(i["session"]) for i in items) + 1)
+    COL_WINDOW = max(10, max(len(i["window_name"]) for i in items) + 1)
+    COL_VISITS = 6
+    COL_AGE = 6
+    COL_ACTIVITY = 8
+    # Total rendered table width (leading space + cols + 11 chars of separators).
+    TABLE_WIDTH = 1 + COL_SESSION + COL_WINDOW + COL_VISITS + COL_AGE + COL_ACTIVITY + 11
+
+    def build_flat_view(items):
+        """Flat MRU list."""
+        header = f" {'Session'.ljust(COL_SESSION)}  {'Window'.ljust(COL_WINDOW)}  {'Visits'.rjust(COL_VISITS)}  {'Last'.rjust(COL_AGE)}    {'Δ'.ljust(COL_ACTIVITY)}"
+        sep = " " + "─" * (COL_SESSION + COL_WINDOW + COL_VISITS + COL_AGE + COL_ACTIVITY + 11)
+        lines = [header, sep]
+        data = [None, None]
+        for item in items:
+            line = f" {item['session'].ljust(COL_SESSION)}  {item['window_name'].ljust(COL_WINDOW)}  {str(item['visits']).rjust(COL_VISITS)}  {item['age'].rjust(COL_AGE)}    {item.get('activity', '-').ljust(COL_ACTIVITY)}"
+            lines.append(line)
+            data.append(item)
+        return lines, data, 2  # header_rows = 2
+
+    def build_grouped_view(items):
+        """Grouped by session, MRU within each session, sessions ordered by most recent terminal."""
+        # Group items by session, preserving MRU order within each
+        from collections import OrderedDict
+        groups = OrderedDict()
+        for item in items:
+            s = item["session"]
+            if s not in groups:
+                groups[s] = []
+            groups[s].append(item)
+
+        header = f" {'Session'.ljust(COL_SESSION)}  {'Window'.ljust(COL_WINDOW)}  {'Visits'.rjust(COL_VISITS)}  {'Last'.rjust(COL_AGE)}    {'Δ'.ljust(COL_ACTIVITY)}"
+        sep = " " + "─" * (COL_SESSION + COL_WINDOW + COL_VISITS + COL_AGE + COL_ACTIVITY + 11)
+        lines = [header, sep]
+        data = [None, None]
+        non_selectable = {0, 1}  # header + separator rows
+        group_headers = []  # 0-based indices of "┌ session" lines
+
+        for session_name, session_items in groups.items():
+            # Session header
+            session_line = f" ┌ {session_name}"
+            lines.append(session_line)
+            data.append(None)
+            non_selectable.add(len(lines) - 1)
+            group_headers.append(len(lines) - 1)
+            # Terminals in this session
+            for item in session_items:
+                line = f" │ {''.ljust(COL_SESSION)}{item['window_name'].ljust(COL_WINDOW)}  {str(item['visits']).rjust(COL_VISITS)}  {item['age'].rjust(COL_AGE)}    {item.get('activity', '-').ljust(COL_ACTIVITY)}"
+                lines.append(line)
+                data.append(item)
+            # Closing line
+            lines.append(f" └{'─' * (COL_SESSION + COL_WINDOW + COL_VISITS + COL_AGE + COL_ACTIVITY + 9)}")
+            data.append(None)
+            non_selectable.add(len(lines) - 1)
+
+        # Extract items in display order (no nulls)
+        display_items = [d for d in data if d is not None]
+        return lines, data, 2, non_selectable, group_headers, display_items
+
+    # Build both views
+    flat_lines, flat_data, flat_header = build_flat_view(items)
+    grouped_result = build_grouped_view(items)
+    grouped_lines, grouped_data, grouped_header, grouped_non_sel, grouped_headers, grouped_display_items = grouped_result
+
+    # Convert non_selectable set to sorted list for JSON
+    grouped_non_sel_list = sorted(grouped_non_sel)
+
+    picker_json = os.path.join(STATE_DIR, "mru_picker.json")
+    grouped_json = os.path.join(STATE_DIR, "mru_grouped.json")
+    display_file = os.path.join(STATE_DIR, "mru_display.txt")
+    grouped_display = os.path.join(STATE_DIR, "mru_grouped.txt")
+    picker_lua = os.path.join(STATE_DIR, "mru_picker.lua")
+    selected_file = os.path.join(STATE_DIR, "mru_selected")
+
+    with open(picker_json, "w") as f:
+        json.dump(items, f, default=str)
+    with open(grouped_json, "w") as f:
+        json.dump({"items": grouped_display_items, "non_sel": grouped_non_sel_list, "group_headers": grouped_headers}, f, default=str)
+    with open(display_file, "w") as f:
+        f.write("\n".join(flat_lines))
+    with open(grouped_display, "w") as f:
+        f.write("\n".join(grouped_lines))
+
+    if os.path.exists(selected_file):
+        os.unlink(selected_file)
+
+    # Write lua as a file directly instead of template substitution
+    lua_lines = [
+        f"local flat_json_path = '{picker_json}'",
+        f"local grouped_json_path = '{grouped_json}'",
+        f"local flat_display_path = '{display_file}'",
+        f"local grouped_display_path = '{grouped_display}'",
+        f"local selected_file = '{selected_file}'",
+        f"local col_session = {COL_SESSION}",
+        f"local col_window = {COL_WINDOW}",
+        f"local col_visits = {COL_VISITS}",
+        f"local col_age = {COL_AGE}",
+        f"local col_activity = {COL_ACTIVITY}",
+        f"local table_width = {TABLE_WIDTH}",
+    ]
+    lua_lines.append(r"""
+local function set_wo(win, opt, val)
+    local ok = pcall(vim.api.nvim_set_option_value, opt, val, { win = win })
+    if not ok then
+        pcall(vim.api.nvim_win_set_option, win, opt, val)
+    end
+end
+
+local grouped_mode = false
+local items = nil
+local non_selectable = {}
+local row_to_item = {}
+local item_to_row = {}
+
+local function build_row_map(total_rows)
+    row_to_item = {}
+    item_to_row = {}
+    local idx = 0
+    for r = 1, total_rows do
+        if not non_selectable[r] then
+            idx = idx + 1
+            row_to_item[r] = idx
+            item_to_row[idx] = r
+        end
+    end
+end
+
+local function load_flat()
+    local f = io.open(flat_json_path, 'r')
+    if not f then return end
+    items = vim.json.decode(f:read('*a')); f:close()
+    non_selectable = {[1] = true, [2] = true}
+    group_header_rows = {}
+end
+
+local group_header_rows = {}  -- sorted list of 1-based row numbers that are group headers
+
+local function load_grouped()
+    local f = io.open(grouped_json_path, 'r')
+    if not f then return end
+    local raw = vim.json.decode(f:read('*a')); f:close()
+    items = raw.items
+    non_selectable = {}
+    for _, idx in ipairs(raw.non_sel) do
+        non_selectable[idx + 1] = true
+    end
+    group_header_rows = {}
+    if raw.group_headers then
+        for _, idx in ipairs(raw.group_headers) do
+            table.insert(group_header_rows, idx + 1)  -- 0-based -> 1-based
+        end
+    end
+end
+
+-- Load default mode preference
+local mode_pref = 'flat'
+local mf = io.open(flat_json_path:gsub('mru_picker%.json', 'mru_default_mode'), 'r')
+if mf then mode_pref = mf:read('*a'):gsub('%s+$', ''); mf:close() end
+
+-- Load source pane (the pane the user was in when they opened the picker)
+local source_pane_file = flat_json_path:gsub('mru_picker%.json', 'mru_last_pane')
+local source_pane_id = nil
+local spf = io.open(source_pane_file, 'r')
+if spf then source_pane_id = spf:read('*a'):gsub('%s+$', ''); spf:close() end
+
+if mode_pref == 'grouped' then
+    grouped_mode = true
+    load_grouped()
+else
+    load_flat()
+end
+
+vim.opt.showtabline = 0
+vim.opt.laststatus = 2
+vim.opt.timeoutlen = 300  -- faster key sequence timeout
+
+local list_buf = vim.api.nvim_get_current_buf()
+vim.bo[list_buf].buftype = 'nofile'
+pcall(vim.api.nvim_buf_set_name, list_buf, 'mru')
+vim.bo[list_buf].modifiable = false
+vim.wo.number = false
+vim.wo.cursorline = true
+vim.wo.wrap = false
+vim.wo.foldenable = false
+
+local preview_buf = vim.api.nvim_create_buf(false, true)
+vim.bo[preview_buf].buftype = 'nofile'
+vim.bo[preview_buf].modifiable = false
+
+local list_win = vim.api.nvim_get_current_win()
+vim.cmd('vsplit')
+local preview_win = vim.api.nvim_get_current_win()
+vim.api.nvim_win_set_buf(preview_win, preview_buf)
+set_wo(preview_win, 'wrap', false)
+set_wo(preview_win, 'foldenable', false)
+set_wo(preview_win, 'number', false)
+set_wo(preview_win, 'statusline', ' preview')
+
+-- Size the list split to fit the table exactly when there's room; otherwise
+-- fall back to a proportion so both panes stay usable on narrow terminals.
+-- Re-runs on VimResized (tmux popup resize / terminal font change).
+local function layout_picker()
+    local cols = vim.o.columns
+    local min_preview = 30
+    local desired = table_width + 1
+    local list_width
+    if cols >= desired + min_preview then
+        list_width = desired
+    else
+        list_width = math.min(desired, math.floor(cols * 0.40))
+    end
+    if list_width < 10 then list_width = 10 end
+    local cur = vim.api.nvim_get_current_win()
+    if vim.api.nvim_win_is_valid(list_win) then
+        pcall(vim.api.nvim_set_current_win, list_win)
+        vim.cmd('vertical resize ' .. list_width)
+    end
+    if vim.api.nvim_win_is_valid(cur) then
+        pcall(vim.api.nvim_set_current_win, cur)
+    end
+end
+
+vim.api.nvim_set_current_win(list_win)
+layout_picker()
+vim.api.nvim_create_autocmd('VimResized', { callback = layout_picker })
+
+vim.api.nvim_set_hl(0, 'MruHeader', { fg = '#d8dee9', bold = true })
+vim.api.nvim_set_hl(0, 'MruSep', { fg = '#4c566a' })
+vim.api.nvim_set_hl(0, 'MruSession', { fg = '#88c0d0', bold = true })
+vim.api.nvim_set_hl(0, 'MruWindow', { fg = '#a3be8c' })
+vim.api.nvim_set_hl(0, 'MruVisits', { fg = '#b48ead' })
+vim.api.nvim_set_hl(0, 'MruAge', { fg = '#636c7c' })
+vim.api.nvim_set_hl(0, 'MruActivity', { fg = '#636c7c' })          -- no change / minor (dim)
+vim.api.nvim_set_hl(0, 'MruActivityMed', { fg = '#ebcb8b' })      -- moderate (yellow)
+vim.api.nvim_set_hl(0, 'MruActivityHigh', { fg = '#d08770', bold = true })  -- large (orange bold)
+vim.api.nvim_set_hl(0, 'MruGroupHeader', { fg = '#88c0d0', bold = true })
+vim.api.nvim_set_hl(0, 'MruGroupBorder', { fg = '#4c566a' })
+
+local ns = vim.api.nvim_create_namespace('mru_hl')
+
+local function apply_highlights()
+    vim.api.nvim_buf_clear_namespace(list_buf, ns, 0, -1)
+    local lines = vim.api.nvim_buf_get_lines(list_buf, 0, -1, false)
+    for i, line in ipairs(lines) do
+        if i <= 2 then
+            vim.api.nvim_buf_add_highlight(list_buf, ns, i == 1 and 'MruHeader' or 'MruSep', i - 1, 0, -1)
+        elseif non_selectable[i] then
+            if line:find('[┌└─]') then
+                vim.api.nvim_buf_add_highlight(list_buf, ns, 'MruGroupBorder', i - 1, 0, -1)
+            else
+                vim.api.nvim_buf_add_highlight(list_buf, ns, 'MruGroupHeader', i - 1, 0, -1)
+            end
+        else
+            -- Use byte offsets. In grouped mode, "│" is 3 bytes (UTF-8).
+            -- Flat:    " " + session + " " + window + " " + visits + "  " + age
+            -- Grouped: " │ " + spaces(col_session-2) + window + " " + visits + "  " + age
+            --          1+3+1 = 5 bytes for " │ ", then col_session-2 spaces
+            local off
+            if not grouped_mode then
+                off = 1  -- after leading space
+                vim.api.nvim_buf_add_highlight(list_buf, ns, 'MruSession', i - 1, off, off + col_session)
+                off = off + col_session + 2  -- +2 for double-space separator
+            else
+                -- Color the " │ " border (bytes 1-4)
+                vim.api.nvim_buf_add_highlight(list_buf, ns, 'MruGroupBorder', i - 1, 0, 5)
+                -- " │ " = 5 bytes, then col_session spaces
+                off = 5 + col_session
+            end
+            vim.api.nvim_buf_add_highlight(list_buf, ns, 'MruWindow', i - 1, off, off + col_window)
+            off = off + col_window + 2
+            vim.api.nvim_buf_add_highlight(list_buf, ns, 'MruVisits', i - 1, off, off + col_visits)
+            off = off + col_visits + 2
+            vim.api.nvim_buf_add_highlight(list_buf, ns, 'MruAge', i - 1, off, off + col_age)
+            off = off + col_age + 4
+            -- Activity: color by level
+            local act_text = line:sub(off + 1, off + col_activity):match('^%s*(.-)%s*$') or ''
+            local act_hl = 'MruActivity'
+            if act_text:find('^%+%+') then act_hl = 'MruActivityHigh'
+            elseif act_text == '+' then act_hl = 'MruActivityMed'
+            end
+            vim.api.nvim_buf_add_highlight(list_buf, ns, act_hl, i - 1, off, off + col_activity)
+        end
+    end
+end
+
+local function find_first_selectable()
+    local lines = vim.api.nvim_buf_get_lines(list_buf, 0, -1, false)
+    for i = 1, #lines do
+        if not non_selectable[i] then return i end
+    end
+    return 1
+end
+
+local function move_to_selectable(direction)
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    local total = vim.api.nvim_buf_line_count(list_buf)
+    if direction > 0 then
+        for r = row, total do
+            if not non_selectable[r] then
+                pcall(vim.api.nvim_win_set_cursor, list_win, {r, 0})
+                return
+            end
+        end
+    else
+        for r = row, 1, -1 do
+            if not non_selectable[r] then
+                pcall(vim.api.nvim_win_set_cursor, list_win, {r, 0})
+                return
+            end
+        end
+    end
+end
+
+-- Helper: find first selectable row after a group header
+local function first_item_in_group(header_row)
+    local total = vim.api.nvim_buf_line_count(list_buf)
+    for r = header_row + 1, total do
+        if not non_selectable[r] then return r end
+        -- Stop if we hit the next group header or border
+        if r ~= header_row and non_selectable[r] then
+            -- Check if it's a closing border (means end of group with no items - unlikely)
+            local line = vim.api.nvim_buf_get_lines(list_buf, r - 1, r, false)[1] or ''
+            if line:find('^%s*[└─]') then return nil end
+        end
+    end
+    return nil
+end
+
+-- Override j/k to skip non-selectable rows
+vim.keymap.set('n', 'j', function()
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    local total = vim.api.nvim_buf_line_count(list_buf)
+    for r = row + 1, total do
+        if not non_selectable[r] then
+            pcall(vim.api.nvim_win_set_cursor, list_win, {r, 0})
+            return
+        end
+    end
+end, { buffer = list_buf, noremap = true })
+
+vim.keymap.set('n', 'k', function()
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    for r = row - 1, 1, -1 do
+        if not non_selectable[r] then
+            pcall(vim.api.nvim_win_set_cursor, list_win, {r, 0})
+            return
+        end
+    end
+end, { buffer = list_buf, noremap = true })
+
+-- h = jump to first item of PREVIOUS group
+vim.keymap.set('n', 'h', function()
+    if not grouped_mode or #group_header_rows == 0 then return end
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    -- Find current group index
+    local cur_group = 0
+    for i = #group_header_rows, 1, -1 do
+        if group_header_rows[i] <= row then
+            cur_group = i
+            break
+        end
+    end
+    -- Go to previous group
+    if cur_group > 1 then
+        local target = first_item_in_group(group_header_rows[cur_group - 1])
+        if target then
+            pcall(vim.api.nvim_win_set_cursor, list_win, {target, 0})
+        end
+    end
+end, { buffer = list_buf, noremap = true })
+
+-- l = jump to first item of NEXT group
+vim.keymap.set('n', 'l', function()
+    if not grouped_mode or #group_header_rows == 0 then return end
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    for _, hr in ipairs(group_header_rows) do
+        if hr > row then
+            local target = first_item_in_group(hr)
+            if target then
+                pcall(vim.api.nvim_win_set_cursor, list_win, {target, 0})
+            end
+            return
+        end
+    end
+end, { buffer = list_buf, noremap = true })
+
+-- Scroll commands: move then snap to nearest selectable
+local function snap_to_selectable()
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    if non_selectable[row] then
+        local total = vim.api.nvim_buf_line_count(list_buf)
+        for r = row + 1, total do
+            if not non_selectable[r] then
+                pcall(vim.api.nvim_win_set_cursor, list_win, {r, 0})
+                return
+            end
+        end
+        for r = row - 1, 1, -1 do
+            if not non_selectable[r] then
+                pcall(vim.api.nvim_win_set_cursor, list_win, {r, 0})
+                return
+            end
+        end
+    end
+end
+
+for _, key in ipairs({'<C-d>', '<C-u>', '<C-f>', '<C-b>', '<PageDown>', '<PageUp>'}) do
+    vim.keymap.set('n', key, function()
+        -- Execute the default scroll
+        vim.cmd('normal! ' .. vim.api.nvim_replace_termcodes(key, true, false, true))
+        snap_to_selectable()
+    end, { buffer = list_buf, noremap = true })
+end
+vim.keymap.set('n', 'G', function()
+    vim.cmd('normal! G')
+    snap_to_selectable()
+end, { buffer = list_buf, noremap = true })
+vim.keymap.set('n', 'gg', function()
+    local first = find_first_selectable()
+    pcall(vim.api.nvim_win_set_cursor, list_win, {first, 0})
+end, { buffer = list_buf, noremap = true })
+
+-- Preview cache
+local rendered_bufs = {} -- tail_path -> buf number (with baleia applied)
+local last_preview_path = nil
+
+local function render_preview(item, force)
+    if not item or type(item) ~= 'table' or not item.tail_path then return end
+    if not force and item.tail_path == last_preview_path then return end
+    last_preview_path = item.tail_path
+
+    if not force then
+        local cached_buf = rendered_bufs[item.tail_path]
+        if cached_buf and vim.api.nvim_buf_is_valid(cached_buf) then
+            vim.api.nvim_win_set_buf(preview_win, cached_buf)
+            local lc = vim.api.nvim_buf_line_count(cached_buf)
+            pcall(vim.api.nvim_win_set_cursor, preview_win, {lc, 0})
+            return
+        end
+    end
+
+    -- Read from disk
+    local tf = io.open(item.tail_path, 'r')
+    if not tf then return end
+    local content = tf:read('*a'); tf:close()
+    local lines = vim.split(content, '\n')
+
+    -- Reuse existing cached buffer or create new
+    local buf = rendered_bufs[item.tail_path]
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+        vim.bo[buf].modifiable = true
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    else
+        buf = vim.api.nvim_create_buf(false, true)
+        vim.bo[buf].buftype = 'nofile'
+        vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+        rendered_bufs[item.tail_path] = buf
+    end
+    local bok, bmod = pcall(require, 'baleia')
+    if bok then bmod.setup({async = false}).once(buf) end
+    vim.bo[buf].modifiable = false
+
+    vim.api.nvim_win_set_buf(preview_win, buf)
+    local lc = vim.api.nvim_buf_line_count(buf)
+    pcall(vim.api.nvim_win_set_cursor, preview_win, {lc, 0})
+end
+
+local function get_item_at_row(row)
+    local idx = row_to_item[row]
+    if not idx or not items or not items[idx] then return nil end
+    return items[idx]
+end
+
+local function restore_cursor()
+    if not source_pane_id or source_pane_id == '' then return end
+    local total = vim.api.nvim_buf_line_count(list_buf)
+    for r = 1, total do
+        local item = get_item_at_row(r)
+        if item and item.pane_id == source_pane_id then
+            pcall(vim.api.nvim_win_set_cursor, list_win, {r, 0})
+            return
+        end
+    end
+end
+
+local function update_preview()
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    local item = get_item_at_row(row)
+    if not item then return end
+    render_preview(item, false)
+end
+
+local function refresh_current_preview()
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    local item = get_item_at_row(row)
+    if not item or not item.pane_id then return end
+    -- Re-generate tail file from DB
+    vim.fn.system('tmux-mru refresh-tail ' .. item.pane_id .. ' ' .. item.pane_pid .. ' ' .. item.tail_path)
+    render_preview(item, true)
+end
+
+local reload_in_progress = false
+local function reload_display(path)
+    reload_in_progress = true
+    local f = io.open(path, 'r')
+    if not f then reload_in_progress = false; return end
+    local content = f:read('*a'); f:close()
+    vim.bo[list_buf].modifiable = true
+    vim.api.nvim_buf_set_lines(list_buf, 0, -1, false, vim.split(content, '\n'))
+    vim.bo[list_buf].modifiable = false
+    build_row_map(vim.api.nvim_buf_line_count(list_buf))
+    apply_highlights()
+    local first = find_first_selectable()
+    pcall(vim.api.nvim_win_set_cursor, list_win, {first, 0})
+    reload_in_progress = false
+    update_preview()
+end
+
+vim.api.nvim_create_autocmd('CursorMoved', {
+    buffer = list_buf,
+    callback = function()
+        if not reload_in_progress then update_preview() end
+    end,
+})
+
+vim.api.nvim_set_current_win(list_win)
+if grouped_mode then
+    reload_display(grouped_display_path)
+    set_wo(list_win, 'statusline', ' MRU (by session) — h/l=prev/next group  Enter=switch  tab=flat  q=cancel')
+else
+    build_row_map(vim.api.nvim_buf_line_count(list_buf))
+    apply_highlights()
+    set_wo(list_win, 'statusline', ' MRU — Enter=switch  r=refresh  x=remove  tab=group  q=cancel')
+end
+restore_cursor()
+if not get_item_at_row(vim.api.nvim_win_get_cursor(list_win)[1]) then
+    pcall(vim.api.nvim_win_set_cursor, list_win, {find_first_selectable(), 0})
+end
+update_preview()
+vim.api.nvim_set_current_win(list_win)
+
+vim.keymap.set('n', '<Tab>', function()
+    local wt0 = os.clock()
+    grouped_mode = not grouped_mode
+    last_preview_path = nil
+    if grouped_mode then
+        load_grouped()
+        reload_display(grouped_display_path)
+        set_wo(list_win, 'statusline', ' MRU (by session) — h=group  l=enter  Enter=switch  r=refresh  x=remove  tab=flat  q=cancel')
+    else
+        load_flat()
+        reload_display(flat_display_path)
+        set_wo(list_win, 'statusline', ' MRU — Enter=switch  r=refresh  x=remove  tab=group  q=cancel')
+    end
+    vim.api.nvim_set_current_win(list_win)
+    local wt1 = os.clock()
+    vim.cmd('redraw')
+    local wt2 = os.clock()
+    local lf = io.open('/tmp/mru_g_wall.log', 'a')
+    if lf then
+        lf:write(string.format('g-toggle code: %.0fms  redraw: %.0fms  total: %.0fms\n',
+            (wt1-wt0)*1000, (wt2-wt1)*1000, (wt2-wt0)*1000))
+        lf:close()
+    end
+end, { noremap = true })
+
+vim.keymap.set('n', '<CR>', function()
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    local item = get_item_at_row(row)
+    if not item then return end
+    if item.target then
+        local sf = io.open(selected_file, 'w')
+        if sf then sf:write(item.target); sf:close() end
+    end
+    vim.cmd('qa!')
+end, { noremap = true })
+
+vim.keymap.set('n', 'x', function()
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    local item = get_item_at_row(row)
+    if not item or not item.pane_id then return end
+    -- Delete from DB and regenerate all data files
+    vim.fn.system('tmux-mru delete ' .. item.pane_id .. ' ' .. item.pane_pid)
+    vim.fn.system('tmux-mru regenerate')
+    -- Reload current view
+    last_preview_path = nil
+    if grouped_mode then
+        load_grouped()
+        reload_display(grouped_display_path)
+    else
+        load_flat()
+        reload_display(flat_display_path)
+    end
+end, { noremap = true })
+
+vim.keymap.set('n', 'r', refresh_current_preview, { noremap = true })
+
+-- Auto-refresh preview + activity every 2s
+local activity_path = flat_json_path:gsub('mru_picker', 'mru_activity')
+local function refresh_activity_column()
+    vim.fn.system('tmux-mru refresh-activity')
+    local af = io.open(activity_path, 'r')
+    if not af then return end
+    local raw = af:read('*a'); af:close()
+    local ok2, activity = pcall(vim.json.decode, raw)
+    if not ok2 or not activity then return end
+
+    local lines = vim.api.nvim_buf_get_lines(list_buf, 0, -1, false)
+    local changed = false
+    for i, item in ipairs(items) do
+        if item and type(item) == 'table' and item.pane_id then
+            local key = item.pane_id .. '@' .. item.pane_pid
+            local new_act = activity[key]
+            if new_act and new_act ~= item.activity then
+                item.activity = new_act
+                local display_row = item_to_row[i]
+                if display_row and display_row >= 1 and display_row <= #lines then
+                    -- Pad activity to col_activity width
+                    local padded = new_act
+                    while #padded < col_activity do padded = padded .. ' ' end
+                    -- Replace just the last col_activity bytes of the line
+                    local old_line = lines[display_row]
+                    local new_line = old_line:sub(1, #old_line - col_activity) .. padded
+                    lines[display_row] = new_line
+                    changed = true
+                end
+            end
+        end
+    end
+    if changed then
+        vim.bo[list_buf].modifiable = true
+        vim.api.nvim_buf_set_lines(list_buf, 0, -1, false, lines)
+        vim.bo[list_buf].modifiable = false
+        apply_highlights()
+    end
+end
+
+local refresh_timer = vim.loop.new_timer()
+refresh_timer:start(2000, 2000, vim.schedule_wrap(function()
+    if vim.api.nvim_win_is_valid(list_win) then
+        refresh_current_preview()
+        refresh_activity_column()
+    else
+        refresh_timer:stop()
+    end
+end))
+
+vim.keymap.set('n', 'q', function() refresh_timer:stop(); vim.cmd('qa!') end, { noremap = true })
+vim.keymap.set('n', '<Esc>', function() refresh_timer:stop(); vim.cmd('qa!') end, { noremap = true })
+""")
+    lua_content = "\n".join(lua_lines)
+    with open(picker_lua, "w") as f:
+        f.write(lua_content)
+
+    subprocess.run(["nvim", "-S", picker_lua, display_file])
+
+    if os.path.exists(selected_file):
+        with open(selected_file) as f:
+            target = f.read().strip()
+        os.unlink(selected_file)
+        if target:
+            subprocess.run(["tmux", "switch-client", "-t", target])
+
+
+COMPOSE_SESSION = "tmux-compose"
+
+
+def cmd_pick_session():
+    """Run MRU picker in a tmux-compose window instead of a popup."""
+    # Prepare all data (same as cmd_pick)
+    cmd_pick_prepare()
+
+    state = STATE_DIR
+    picker_lua = os.path.join(state, "mru_picker.lua")
+    display_file = os.path.join(state, "mru_display.txt")
+    selected_file = os.path.join(state, "mru_selected")
+
+    if os.path.exists(selected_file):
+        os.unlink(selected_file)
+
+    has_session = subprocess.run(
+        ["tmux", "has-session", "-t", COMPOSE_SESSION],
+        capture_output=True,
+    ).returncode == 0
+
+    window_name = "mru"
+
+    if has_session:
+        subprocess.run(
+            ["tmux", "kill-window", "-t", f"{COMPOSE_SESSION}:{window_name}"],
+            capture_output=True,
+        )
+        subprocess.run([
+            "tmux", "new-window", "-t", COMPOSE_SESSION,
+            "-n", window_name,
+            "nvim", "-S", picker_lua, display_file,
+        ])
+    else:
+        subprocess.run([
+            "tmux", "new-session", "-d", "-s", COMPOSE_SESSION,
+            "-n", window_name,
+            "nvim", "-S", picker_lua, display_file,
+        ])
+
+    subprocess.run(["tmux", "switch-client", "-t", f"{COMPOSE_SESSION}:{window_name}"])
+
+
+def cmd_pick_prepare():
+    """Prepare MRU picker data files without launching nvim."""
+    items = build_mru_items(with_activity=True)
+    if not items:
+        return
+
+    # Write tail previews
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tails_dir = os.path.join(STATE_DIR, "mru_tails")
+    if os.path.exists(tails_dir):
+        import shutil
+        shutil.rmtree(tails_dir)
+    os.makedirs(tails_dir)
+
+    for i, item in enumerate(items):
+        tail = get_pane_history_tail(item["pane_id"], item["pane_pid"])
+        tail_path = os.path.join(tails_dir, f"{i}.txt")
+        with open(tail_path, "w") as f:
+            f.write(tail)
+        item["tail_path"] = tail_path
+
+    # Build views
+    COL_SESSION = max(10, max(len(i["session"]) for i in items) + 1)
+    COL_WINDOW = max(10, max(len(i["window_name"]) for i in items) + 1)
+    COL_VISITS = 6
+    COL_AGE = 6
+    COL_ACTIVITY = 8
+
+    from collections import OrderedDict
+
+    # Flat view
+    header = f" {'Session'.ljust(COL_SESSION)}  {'Window'.ljust(COL_WINDOW)}  {'Visits'.rjust(COL_VISITS)}  {'Last'.rjust(COL_AGE)}    {'Δ'.ljust(COL_ACTIVITY)}"
+    separator = " " + "─" * (COL_SESSION + COL_WINDOW + COL_VISITS + COL_AGE + COL_ACTIVITY + 11)
+    flat_lines = [header, separator]
+    flat_data = [None, None]
+    for item in items:
+        line = f" {item['session'].ljust(COL_SESSION)}  {item['window_name'].ljust(COL_WINDOW)}  {str(item['visits']).rjust(COL_VISITS)}  {item['age'].rjust(COL_AGE)}    {item.get('activity', '-').ljust(COL_ACTIVITY)}"
+        flat_lines.append(line)
+        flat_data.append(item)
+
+    # Grouped view
+    groups = OrderedDict()
+    for item in items:
+        s = item["session"]
+        if s not in groups:
+            groups[s] = []
+        groups[s].append(item)
+
+    grouped_lines = [header, separator]
+    grouped_data = [None, None]
+    grouped_non_sel = {0, 1}
+    grouped_headers = []
+    for session_name, session_items in groups.items():
+        grouped_lines.append(f" ┌ {session_name}")
+        grouped_data.append(None)
+        grouped_non_sel.add(len(grouped_lines) - 1)
+        grouped_headers.append(len(grouped_lines) - 1)
+        for item in session_items:
+            line = f" │ {''.ljust(COL_SESSION)}{item['window_name'].ljust(COL_WINDOW)}  {str(item['visits']).rjust(COL_VISITS)}  {item['age'].rjust(COL_AGE)}    {item.get('activity', '-').ljust(COL_ACTIVITY)}"
+            grouped_lines.append(line)
+            grouped_data.append(item)
+        grouped_lines.append(f" └{'─' * (COL_SESSION + COL_WINDOW + COL_VISITS + COL_AGE + COL_ACTIVITY + 9)}")
+        grouped_data.append(None)
+        grouped_non_sel.add(len(grouped_lines) - 1)
+
+    # Write files
+    picker_json = os.path.join(STATE_DIR, "mru_picker.json")
+    grouped_json = os.path.join(STATE_DIR, "mru_grouped.json")
+    display_file = os.path.join(STATE_DIR, "mru_display.txt")
+    grouped_display = os.path.join(STATE_DIR, "mru_grouped.txt")
+    picker_lua = os.path.join(STATE_DIR, "mru_picker.lua")
+    selected_file = os.path.join(STATE_DIR, "mru_selected")
+
+    grouped_display_items = [d for d in grouped_data if d is not None]
+
+    with open(picker_json, "w") as f:
+        json.dump(items, f, default=str)
+    with open(grouped_json, "w") as f:
+        json.dump({"items": grouped_display_items, "non_sel": sorted(grouped_non_sel), "group_headers": grouped_headers}, f, default=str)
+    with open(display_file, "w") as f:
+        f.write("\n".join(flat_lines))
+    with open(grouped_display, "w") as f:
+        f.write("\n".join(grouped_lines))
+
+    if os.path.exists(selected_file):
+        os.unlink(selected_file)
+
+    # Write lua (same as cmd_pick)
+    lua_lines = [
+        f"local flat_json_path = '{picker_json}'",
+        f"local grouped_json_path = '{grouped_json}'",
+        f"local flat_display_path = '{display_file}'",
+        f"local grouped_display_path = '{grouped_display}'",
+        f"local selected_file = '{selected_file}'",
+        f"local col_session = {COL_SESSION}",
+        f"local col_window = {COL_WINDOW}",
+        f"local col_visits = {COL_VISITS}",
+        f"local col_age = {COL_AGE}",
+        f"local col_activity = {COL_ACTIVITY}",
+    ]
+    # Read the lua body from the existing picker lua template in cmd_pick
+    # (reuse the same lua body)
+    lua_lines.append(_get_picker_lua_body())
+    lua_content = "\n".join(lua_lines)
+    with open(picker_lua, "w") as f:
+        f.write(lua_content)
+
+
+def cmd_default_mode():
+    """Toggle or set the default picker mode (flat/grouped)."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if len(sys.argv) >= 3:
+        mode = sys.argv[2]
+    else:
+        # Toggle
+        current = "flat"
+        if os.path.exists(MODE_PREF_FILE):
+            with open(MODE_PREF_FILE) as f:
+                current = f.read().strip()
+        mode = "grouped" if current != "grouped" else "flat"
+    with open(MODE_PREF_FILE, "w") as f:
+        f.write(mode)
+    print(f"MRU picker default mode: {mode}")
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: tmux-mru <record|pick|pick-session|default-mode [flat|grouped]> [pane_id]")
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+    # `record` (and the background refreshers) fire from tmux hooks on every
+    # window/session change — best-effort telemetry. An uncaught exception there
+    # (e.g. a fork failure under OOM, or a transient DB lock) would surface as a
+    # tmux run-shell error popup. Catch everything: log it for diagnosis and
+    # exit 0 so nothing pops up. Interactive pickers print a one-liner instead
+    # of a raw traceback.
+    interactive = cmd in ("pick", "pick-session")
+    try:
+        if cmd == "record" and len(sys.argv) >= 3:
+            cmd_record(sys.argv[2])
+        elif cmd == "delete" and len(sys.argv) >= 4:
+            cmd_delete(sys.argv[2], sys.argv[3])
+        elif cmd == "regenerate":
+            cmd_regenerate()
+        elif cmd == "refresh-activity":
+            cmd_refresh_activity()
+        elif cmd == "refresh-tail" and len(sys.argv) >= 5:
+            cmd_refresh_tail(sys.argv[2], sys.argv[3], sys.argv[4])
+        elif cmd == "pick":
+            cmd_pick()
+        elif cmd == "pick-session":
+            cmd_pick_session()
+        elif cmd == "default-mode":
+            cmd_default_mode()
+        else:
+            print(f"Unknown command: {cmd}")
+            sys.exit(1)
+    except SystemExit:
+        raise
+    except BaseException:
+        _log_exc(cmd)
+        if interactive:
+            print("tmux-mru: error (logged to ~/.cache/tmux/tmux-mru.log)")
+        sys.exit(0)  # never pop a traceback into tmux
+
+
+if __name__ == "__main__":
+    main()

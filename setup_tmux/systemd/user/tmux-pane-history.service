@@ -1,0 +1,12 @@
+[Unit]
+Description=Tmux pane scrollback history capture daemon
+After=default.target
+
+[Service]
+ExecStart=%h/.local/bin/tmux-pane-history daemon
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target

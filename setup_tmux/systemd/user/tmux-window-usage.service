@@ -1,0 +1,12 @@
+[Unit]
+Description=Tmux window pane status poller (ready/busy/blocked)
+After=default.target
+
+[Service]
+ExecStart=%h/.local/bin/tmux-window-usage daemon
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=:0
+
+[Install]
+WantedBy=default.target

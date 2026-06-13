@@ -1,32 +1,6 @@
 "Ensure clipboard works with vimx
 set clipboard=unnamed
 
-"Only use base dir tags
-set tags=./tags;
-function! FindNearestTagsFile()
-  let l:dir = expand('%:p:h')
-  let l:pwd = getcwd()
-  if l:dir =~# '^\w\+://'
-    return ''
-  endif
-  while 1
-    if filereadable(l:dir . '/tags')
-      return l:dir . '/tags'
-    endif
-    if l:dir ==# l:pwd || l:dir ==# '/' || fnamemodify(l:dir, ':h') ==# l:dir
-      break
-    endif
-    let l:dir = fnamemodify(l:dir, ':h')
-  endwhile
-  " fallback: use tags in current working dir if found
-  if filereadable(l:pwd . '/tags')
-    return l:pwd . '/tags'
-  endif
-  return ''
-endfunction
-
-autocmd BufEnter * if &buftype ==# '' && expand('%:p') !~# '^\w\+://' | let &tags = FindNearestTagsFile() | endif
-
 "Turn on filetype plugins and indentation
 filetype indent plugin on
 
@@ -111,7 +85,9 @@ if !&diff
     Plug 'sjl/vitality.vim'
     Plug 'Yggdroot/LeaderF', { 'do': ':LeaderfInstallCExtension' }
     Plug 'Makaze/AnsiEsc'
+    Plug 'm00qek/baleia.nvim'
     Plug 'm-pilia/vim-ccls'
+
 endif
 
 " These are colorschemes so okay to have in diff
@@ -183,6 +159,11 @@ if !&diff && !&pvw
     nnoremap <silent> <M-m> :CocList outline<cr>
     nmap <silent> <C-n> :CocList symbols<cr>
 
+    " Use tagls for symbols
+    nmap <silent> <M-n> :Tagls<cr>
+    nmap <silent> <M-i> :TaglsAt<cr>
+    nmap <silent> <M-u> :TaglsRef<cr>
+
     " Use Leaderf for some functionality if its slicker
     " necessary due to how slow CoC is) Note, the integration is worse.
     "nmap <silent> <C-l> :TagbarClose<cr>:Leaderf! coc declarations --auto-jump <CR>
@@ -198,7 +179,6 @@ if !&diff && !&pvw
     nn <silent> <M-r> :Leaderf rg --regexMode<cr>
 
 
-    nmap <silent> <M-n> :LfTagIncremental<cr>
     "nmap <silent> <C-h> :CocList --interactive symbols -kind class<cr>
     nmap <silent> <C-f> :Leaderf file --no-ignore --regexMode<cr>
     nmap <silent> <C-M-f> :Leaderf! file --no-ignore --regexMode<cr>
@@ -347,125 +327,146 @@ if !&diff && !&pvw
     endfunction
 
 
-    function! OpenFileAndGitDiffWin(base, ...) abort
-      " Use provided base, or fall back to global
-      let l:base = a:base !=# '' ? a:base : get(g:, 'diff_base', 'origin/HEAD')
-
-      " Use provided comp_base if present, otherwise fall back to global
-      let l:comp_base = (a:0 >= 1 && !empty(a:1)) ? a:1 : get(g:, 'diff_comp_base', '')
-
-      wincmd gf
-
-      if empty(l:comp_base)
-        call GitDiffWin(l:base)
+    " --- Git diff range plumbing -------------------------------------------
+    " Parse a git range string ("A..B", "A...B", or "A") into components.
+    " An empty side means "working tree" (the file on disk, editable).
+    function! s:ParseDiffRange(range) abort
+      let r = trim(a:range)
+      if r =~# '\.\.\.'
+        let parts = split(r, '\.\.\.', 1)
+        return {'left': trim(get(parts, 0, '')), 'right': trim(get(parts, 1, '')),
+              \ 'sep': '...', 'range': r}
+      elseif r =~# '\.\.'
+        let parts = split(r, '\.\.', 1)
+        return {'left': trim(get(parts, 0, '')), 'right': trim(get(parts, 1, '')),
+              \ 'sep': '..', 'range': r}
       else
-        call GitDiffWin2(l:base, l:comp_base)
+        return {'left': r, 'right': '', 'sep': '', 'range': r}
       endif
+    endfunction
+
+    " For 3-dot ranges, the effective left side for per-file diff is the
+    " merge-base of left and right.
+    function! s:ResolveLeftRef(info) abort
+      if a:info.sep ==# '...' && !empty(a:info.left)
+        let l:other = empty(a:info.right) ? 'HEAD' : a:info.right
+        let l:mb = systemlist('git merge-base ' . shellescape(a:info.left) . ' ' . shellescape(l:other))
+        if v:shell_error == 0 && len(l:mb) > 0 && !empty(l:mb[0])
+          return trim(l:mb[0])
+        endif
+      endif
+      return a:info.left
+    endfunction
+
+    function! s:ShortRef(ref) abort
+      if empty(a:ref) | return '<wt>' | endif
+      if a:ref =~# '^[0-9a-f]\{20,\}$' | return strpart(a:ref, 0, 7) | endif
+      return a:ref
+    endfunction
+
+    " Replace current window's buffer with a read-only scratch holding
+    " `git show <ref>:<file>`.
+    function! s:LoadRefIntoCurrentWindow(ref, filename, ft) abort
+      enew
+      setlocal buftype=nofile bufhidden=wipe noswapfile
+      silent execute 'r!git show ' . shellescape(a:ref . ':' . a:filename)
+      let &ft = a:ft
+      normal! ggdd
+      setlocal readonly nomodifiable
+      call SetName('[' . s:ShortRef(a:ref) . '] ' . fnamemodify(a:filename, ':t'))
+    endfunction
+
+    " Per-window statusline indicating "this is the working tree (editable)".
+    function! s:MarkWorkingTreeWindow() abort
+      setlocal statusline=[working\ tree]\ %f\ %=%y\ %r%m
+    endfunction
+
+    " Open a TRUE 2-way diff for the current buffer's file at left_ref vs
+    " right_ref. Empty ref means working tree (disk file, RW). The other
+    " side is always RO.
+    " Pre: current window has the disk file open (e.g. via 'wincmd gf').
+    function! s:GitDiff2Way(left_ref, right_ref) abort
+      if !filereadable(@%) | return | endif
+      if empty(a:left_ref) && empty(a:right_ref)
+        echohl WarningMsg | echo '[GitDiff] both refs empty; nothing to diff' | echohl None
+        return
+      endif
+
+      let l:filename = expand('%')
+      let l:thisft = &ft
+      let l:left_label  = s:ShortRef(a:left_ref)
+      let l:right_label = s:ShortRef(a:right_ref)
+
+      " Right side = current window. Replace with scratch unless right is wt.
+      if empty(a:right_ref)
+        call s:MarkWorkingTreeWindow()
+      else
+        call s:LoadRefIntoCurrentWindow(a:right_ref, l:filename, l:thisft)
+      endif
+
+      " Left side = new window on the left.
+      if empty(a:left_ref)
+        execute 'leftabove vsplit ' . fnameescape(l:filename)
+        call s:MarkWorkingTreeWindow()
+      else
+        leftabove vnew
+        call s:LoadRefIntoCurrentWindow(a:left_ref, l:filename, l:thisft)
+      endif
+
+      windo diffthis
+      redraw
+      echohl ModeMsg
+      echo '[GitDiff] ' . l:left_label . '  <->  ' . l:right_label . '   :  ' . fnamemodify(l:filename, ':t')
+      echohl None
+    endfunction
+
+    " --- Public entry points -----------------------------------------------
+    " Open file under cursor and 2-way diff it for the active range.
+    " Argument is a git range string ("A..B", "A...B", "A"); empty falls back
+    " to the global g:diff_range_info set by GitDiffFilesBetween / GitDiffFiles.
+    function! OpenFileAndGitDiffWin(range, ...) abort
+      let l:info = !empty(a:range) ? s:ParseDiffRange(a:range)
+                              \ : get(g:, 'diff_range_info', {})
+      if empty(l:info)
+        echohl WarningMsg | echo '[GitDiff] no range set; run :call GitDiffFilesBetween("A..B") first' | echohl None
+        return
+      endif
+      wincmd gf
+      let l:left_ref = s:ResolveLeftRef(l:info)
+      let l:right_ref = l:info.right
+      call s:GitDiff2Way(l:left_ref, l:right_ref)
     endfunction
 
 
     function! GitDiffFiles(base)
+      call GitDiffFilesBetween(a:base)
+    endfunction
+
+    " Show changed files for a git range string. Accepts:
+    "   "A..B"   — git diff --name-status A..B
+    "   "A...B"  — git diff --name-status A...B
+    "   "A"      — git diff --name-status A   (A vs working tree)
+    function! GitDiffFilesBetween(range) abort
+      let l:info = s:ParseDiffRange(a:range)
       call ScratchThisTab()
-      execute 'r!git diff --name-status ' . trim(a:base)
+      execute 'r!git diff --name-status ' . l:info.range
       set ft=git
       normal! ggdd
-      call SetName('[filelist] ' . trim(a:base))
+      let l:title = '[filelist] ' . s:ShortRef(l:info.left)
+            \ . (empty(l:info.sep) ? '' : (l:info.sep . s:ShortRef(l:info.right)))
+      call SetName(l:title)
       wincmd H
-      " Use global variable so other tabs/windows can access it
-      let g:diff_base = a:base
-      if exists('g:diff_comp_base')
+
+      let g:diff_range_info = l:info
+      " Backward-compat globals (some older callers may still read these).
+      let g:diff_base = empty(l:info.right) ? l:info.left : l:info.right
+      if !empty(l:info.left) && !empty(l:info.right)
+        let g:diff_comp_base = l:info.left
+      elseif exists('g:diff_comp_base')
         unlet g:diff_comp_base
       endif
     endfunction
 
-    function! GitDiffFilesBetween(base, ...) abort
-      let l:base = trim(a:base)
-      let l:comp_base = (a:0 >= 1 && !empty(a:1)) ? trim(a:1) : l:base . '~1'
-
-      call ScratchThisTab()
-      let l:cmd = 'git diff --name-status ' . l:comp_base . '..' . l:base
-      execute 'r!' . l:cmd
-      set ft=git
-      normal! ggdd
-      call SetName('[filelist] ' . l:comp_base . '..' . l:base)
-      wincmd H
-
-      let g:diff_base = l:base
-      let g:diff_comp_base = l:comp_base
-    endfunction
-
-
-    function! GenTags()
-      execute '!ctags -R --append=yes --exclude=.git --exclude="*build*" --exclude="*frontend*" --exclude="*Test/FsiDataFiles*" --exclude=".ccls-cache" --exclude="docker" --exclude="FsiDataFiles" .'
-
-      " Pretty success message with green color and checkmark
-      echohl Question
-      echon "✔ Tags updated successfully\n"
-      echohl None
-    endfunction
-
-
-function! GenerateTagsIncrementally()
-python3 << EOF
-import os
-
-print("🔍 Incremental tag generation...")
-
-TAGS_FILE = 'tags'
-LIST_FILE = 'list'
-EXCLUDE_DIRS = ['.git', 'build', 'node_modules', '.ccls-cache', 'dist', '__pycache__', 'docker', 'FsiDataFiles', 'frontend', 'tag.ignore']
-
-try:
-    tags_mtime = os.stat(TAGS_FILE).st_mtime
-except FileNotFoundError:
-    tags_mtime = 0
-
-with open(LIST_FILE, 'w') as fp:
-    for dirpath, dirnames, filenames in os.walk(os.getcwd()):
-        # Exclude directories that partially match any pattern
-        dirnames[:] = [d for d in dirnames if not any(x in d for x in EXCLUDE_DIRS)]
-        for filename in filenames:
-            full_path = os.path.join(dirpath, filename)
-            try:
-                if os.stat(full_path).st_mtime > tags_mtime:
-                    fp.write(full_path + '\n')
-            except FileNotFoundError:
-                continue
-
-exit_code = os.system(
-    'ctags --recurse --append --fields=+aimS --extras=+q '
-    '--c-kinds=+p --c++-kinds=+p -L ' + LIST_FILE
-)
-
-os.remove(LIST_FILE)
-
-if exit_code == 0:
-    print("✔ Tags updated incrementally.")
-else:
-    print("✘ ctags failed.")
-
-EOF
-endfunction
-
-command! GenerateTagsIncrementally call GenerateTagsIncrementally()
-
-command! LfTagIncremental call GenerateTagsIncrementally() | Leaderf tag
-
-    let g:Lf_AutoUpdateTags = v:true
-
-
-    function! LeaderfTagWithOptionalUpdate()
-      if get(g:, 'Lf_AutoUpdateTags', v:false)
-        call GenTags()
-      endif
-      Leaderf! tag
-    endfunction
-
-    command! ToggleAutoTagUpdate let g:Lf_AutoUpdateTags = !get(g:, 'Lf_AutoUpdateTags', v:false) | echo "Auto tag update: " . (g:Lf_AutoUpdateTags ? "ON ✔" : "OFF ✘")
-
-    command! LfTag call LeaderfTagWithOptionalUpdate()
-
-    command! -nargs=0 GenTags call GenTags()
 
     function Terminal(name)
        execute 'terminal'
@@ -510,73 +511,10 @@ command! LfTagIncremental call GenerateTagsIncrementally() | Leaderf tag
 
     command! -nargs=1 Rh call RipgrepLocalDefault(<f-args>)
 
-    function! GitDiffWin2(base1, base2) abort
-      if !filereadable(@%)
-        return
-      endif
-
-      let l:old_more = &more
-      set nomore
-
-      try
-        let l:bufname = expand('%')
-        let l:thisft = &ft
-        let l:oldname1 = ''
-        let l:oldname2 = ''
-        let l:is_added2 = v:false
-
-        let l:ns_output = systemlist('git diff --name-status ' . shellescape(a:base1 . '..' . a:base2))
-
-        for line in l:ns_output
-          let l:fields = split(line, '\t')
-          if len(l:fields) == 2
-            if l:fields[0] ==# 'M' && l:fields[1] ==# l:bufname
-              let l:oldname1 = l:bufname
-              let l:oldname2 = l:bufname
-              break
-            elseif l:fields[0] ==# 'A' && l:fields[1] ==# l:bufname
-              let l:is_added2 = v:true
-              break
-            endif
-          elseif len(l:fields) == 3 && l:fields[2] ==# l:bufname && l:fields[0] =~# '^R\d\+'
-            let l:oldname1 = l:fields[1]
-            let l:oldname2 = l:bufname
-            break
-          endif
-        endfor
-
-        if l:is_added2
-          echohl WarningMsg
-          echo '[GitDiffWin2] File "' . l:bufname . '" was added in ' . a:base2 . '; no diff available in ' . a:base1
-          echohl None
-          return
-        endif
-
-        if l:oldname1 ==# ''
-          let l:oldname1 = l:bufname
-          let l:oldname2 = l:bufname
-        endif
-
-        call Scratch()
-        silent execute 'r!git show ' . shellescape(a:base1 . ':' . l:oldname1)
-        let &ft = l:thisft
-        normal! ggdd
-        call SetName('[diffwin2] ' . a:base1 . ':' . l:oldname1)
-        wincmd H
-        wincmd w
-
-        call Scratch()
-        silent execute 'r!git show ' . shellescape(a:base2 . ':' . l:oldname2)
-        let &ft = l:thisft
-        normal! ggdd
-        call SetName('[diffwin2] ' . a:base2 . ':' . l:oldname2)
-        wincmd H
-        wincmd w
-
-        execute 'windo diffthis'
-      finally
-        let &more = l:old_more
-      endtry
+    " GitDiffWin2 — kept for backward-compat with any older callers.
+    " Now performs a TRUE 2-way diff via s:GitDiff2Way (was previously 3-way).
+    function! GitDiffWin2(left_ref, right_ref) abort
+      call s:GitDiff2Way(a:left_ref, a:right_ref)
     endfunction
 
     nmap <leader>qf <Plug>(coc-fix-current)
@@ -680,9 +618,9 @@ autocmd BufReadPost quickfix nnoremap <buffer> <CR> <CR>
 set previewheight=25
 nmap <M-]> <C-w>}<C-w><C-w>
 
-""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 "" COLORS AND DISPLAY:
-""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 set termguicolors
 colorscheme onedark
 
@@ -701,13 +639,15 @@ hi TabLineNC guibg=#dae2f2 guifg=#74a0f7
 " Normal bg
 hi Normal guibg=#1b2128
 " helps visualize active windows
-autocmd FocusLost * hi Normal guibg=#0e191f
-autocmd FocusGained * hi Normal guibg=#1b2128
+" Temporarily disabled: pane switching in tmux fires FocusLost/FocusGained
+" and changing Normal.guibg makes Neovim flash/jump visually.
+"autocmd FocusLost * hi Normal guibg=#0e191f
+"autocmd FocusGained * hi Normal guibg=#1b2128
 
 
-""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 "" FIX TABLLINE TO SHOW NUMBERS:
-""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
+"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 " Rename tabs to show tab number.
 " (Based on http://stackoverflow.com/questions/5927952/whats-implementation-of-vims-default-tabline-function)
 " taken from https://superuser.com/a/477221/734404
@@ -779,12 +719,12 @@ function! ConfirmQuit(all)
     endif
 endfu
 
-au termopen * cnoremap <silent> q<cr> call ConfirmQuit(0)<cr>
-au termenter * cnoremap <silent> q<cr> call ConfirmQuit(0)<cr>
-au termleave * cnoremap <silent> q<cr> call ConfirmQuit(0)<cr>
-au termopen * cnoremap <silent> qa<cr> call ConfirmQuit(1)<cr>
-au termenter * cnoremap <silent> qa<cr> call ConfirmQuit(1)<cr>
-au termleave * cnoremap <silent> qa<cr> call ConfirmQuit(1)<cr>
+"au termopen * cnoremap <silent> q<cr> call ConfirmQuit(0)<cr>
+"au termenter * cnoremap <silent> q<cr> call ConfirmQuit(0)<cr>
+"au termleave * cnoremap <silent> q<cr> call ConfirmQuit(0)<cr>
+"au termopen * cnoremap <silent> qa<cr> call ConfirmQuit(1)<cr>
+"au termenter * cnoremap <silent> qa<cr> call ConfirmQuit(1)<cr>
+"au termleave * cnoremap <silent> qa<cr> call ConfirmQuit(1)<cr>
 
 "let g:coc_global_extensions = ['coc-json', 'coc-tsserver', 'coc-clangd', 'coc-pyright']
 let g:coc_global_extensions = ['coc-json', 'coc-tsserver', 'coc-pyright']
@@ -812,7 +752,6 @@ call extend(g:keymap_cheatsheet_desc.n, {
 \ '<C-n>': 'Workspace symbols (CocList symbols)',
 \ '<M-l>': 'Search lines in current buffer (LeaderF line)',
 \ '<M-r>': 'Ripgrep project search (LeaderF rg)',
-\ '<M-n>': 'Incremental tags update + tag search (LeaderF tag)',
 \ '<C-f>': 'Find files (LeaderF file, includes ignored)',
 \ '<C-M-f>': 'Find files (LeaderF file, fullscreen, includes ignored)',
 \ '<C-g>': 'Recent files (LeaderF mru)',
@@ -828,10 +767,10 @@ call extend(g:keymap_cheatsheet_desc.n, {
 \ '<M-k>': 'Close Tagbar and open CoC outline',
 \ '<M-f>': 'Diff current file vs default base (GitDiffWin)',
 \ '<M-F>': 'Diff current file vs origin/HEAD (GitDiffWin)',
-\ '<M-s>': 'Open file under cursor and diff vs default base',
-\ '<M-S>': 'Open file under cursor and diff vs origin/HEAD',
-\ '<M-z>': 'List changed files vs HEAD (GitDiffFiles)',
-\ '<M-Z>': 'List changed files vs origin/HEAD (GitDiffFiles)',
+\ '<M-s>': 'Open file under cursor and 2-way diff for active range',
+\ '<M-S>': 'Open file under cursor and 2-way diff vs origin/HEAD',
+\ '<M-z>': 'List changed files vs HEAD (working tree)',
+\ '<M-Z>': 'List changed files vs origin/HEAD (working tree)',
 \ '<M-h>': 'Git blame in a scratch window',
 \ '<M-1>': 'Go to tab 1',
 \ '<M-2>': 'Go to tab 2',
@@ -921,16 +860,48 @@ call extend(g:keymap_cheatsheet_desc.c, {
 \ }, 'keep')
 
 lua << EOF
-require("gitdiffiles").setup({
-  log_max = 200,
-  ui = { file_width = 50, open_in_tab = false },
-  keys = {
-    open = "<CR>",
-    refresh = "r",
-    quit = "q",
-    set_source = "s",
-    set_target = "t",
-  },
-})
+local ok, gdf = pcall(require, "gitdiffiles")
+if ok then
+  gdf.setup({
+    log_max = 0,
+    diff_mode = "pr",
+    ui = { file_width = 50, open_in_tab = false },
+    keys = {
+      open = "<CR>",
+      refresh = "r",
+      quit = "q",
+      set_source = "s",
+      set_target = "t",
+      toggle_mode = "m",
+    },
+  })
+end
+
+
+local tsxref = vim.fn.expand("~/.local/bin/tsxref")
+if vim.fn.executable(tsxref) ~= 1 then
+  tsxref = vim.fn.expand("~/software/tsxref/build/tsxref")
+end
+
+if vim.fn.executable(tsxref) == 1 then
+  vim.api.nvim_create_autocmd("FileType", {
+    pattern = { "c", "cpp" },
+    callback = function(args)
+      -- vim.fs.root is 0.10+; on 0.9.5 derive the root from find+dirname.
+      -- The server also checks <root>/build/compile_commands.json itself.
+      local found = vim.fs.find(
+        { "compile_commands.json", ".git" },
+        { upward = true, path = vim.api.nvim_buf_get_name(args.buf) }
+      )[1]
+      local root = found and vim.fs.dirname(found) or vim.fn.getcwd()
+      vim.lsp.start({
+        name = "tsxref",
+        cmd = { tsxref, "lsp" },
+        root_dir = root,
+      })
+    end,
+  })
+end
+
 EOF
 
