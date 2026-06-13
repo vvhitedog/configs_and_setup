@@ -34,9 +34,11 @@ Terminals:
 - `--terminal both`: install/sync both terminal configs
 - `--terminal none`: skip terminal install/sync
 
-Tmux-compose installs `tmux-compose`, `tmux-mru`, `tmux-window-usage`, `tmux-pane-history`, and related helpers. By default it copies and enables the user services/timer for pane history, window usage, and recovery snapshots. Use `--no-systemd` to copy helpers without enabling services, or `--skip-tmux-compose` to skip the toolkit. The installer reloads the running tmux config when it is run from inside tmux; both `prefix+c` and `prefix+C` create a cwd-inheriting window through tmux-compose.
+Tmux-compose installs `tmux-compose`, `tmux-mru`, `tmux-window-usage`, `tmux-pane-history`, and related helpers. By default it copies and enables the user services/timer for pane history, window usage, and recovery snapshots. Use `--no-systemd` to copy helpers without enabling services, or `--skip-tmux-compose` to skip the toolkit. The installer reloads the running tmux config when it is run from inside tmux; both `prefix+c` and `prefix+C` create a cwd-inheriting window through tmux-compose. Window-name prompting is controlled by `prompt-on-create` in the tmux-compose status screen (`prefix+S`, then `p`) and is stored in `~/.cache/tmux/compose-state/prompt_on_create`; the default is on.
 
 ble.sh is installed from `https://github.com/akinomyoga/ble.sh.git` when missing or when reinstall/update is accepted. It loads before Atuin from the synced bash custom file. Atuin is installed via apt when available, otherwise via the official release binary installer with path modification disabled; shell integration is handled only by `setup_bash/bashrc`. Use `--skip-blesh` to skip ble.sh install and `.blerc` sync.
+
+Directory colors come from two places: `ls` uses Ubuntu `dircolors`/`LS_COLORS` (`di=01;34`, bold ANSI blue), while ble.sh completion uses `setup_bash/blerc` faces such as `filename_directory=fg=#81a1c1,bold`. The terminal palette maps that ANSI blue to the Terminator/tmux palette.
 
 Neovim prefers version >= 0.9.5. The script installs vim-plug, can run `:PlugInstall`, and copies local pack plugins. CoC requires Node.js >= 16.18.0; the script can install Node.js LTS, update npm, and install Yarn if needed. Optional local binary integrations such as `tagls` and `tsxref` are guarded so Neovim starts cleanly when those binaries are not installed.
 
