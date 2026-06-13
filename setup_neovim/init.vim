@@ -84,8 +84,12 @@ if !&diff
     Plug 'jremmen/vim-ripgrep'
     Plug 'sjl/vitality.vim'
     Plug 'Yggdroot/LeaderF', { 'do': ':LeaderfInstallCExtension' }
+    Plug 'junegunn/fzf', { 'do': { -> fzf#install() } }
+    Plug 'junegunn/fzf.vim'
     Plug 'Makaze/AnsiEsc'
     Plug 'm00qek/baleia.nvim'
+    Plug '3rd/image.nvim'
+    Plug 'vague2k/vague.nvim'
     Plug 'm-pilia/vim-ccls'
 
 endif
@@ -622,7 +626,10 @@ nmap <M-]> <C-w>}<C-w><C-w>
 "" COLORS AND DISPLAY:
 """""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 set termguicolors
-colorscheme onedark
+silent! colorscheme onedark
+if !exists('g:colors_name')
+  colorscheme default
+endif
 
 set statusline=%f[%{strlen(&fenc)?&fenc:'none'},%{&ff}]%h%m%r%y%=%c,%l/%L\ %P
 

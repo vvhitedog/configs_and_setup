@@ -23,6 +23,32 @@ MIN_NODE_VERSION="16.18.0"
 MIN_NPM_VERSION="8.0.0"
 MIN_YARN_VERSION="1.22.0"
 NPM_PREFIX="$HOME/.local"
+NVIM_REMOTE_PLUGINS=(
+  coc.nvim
+  a.vim
+  tagbar
+  vim-ripgrep
+  vitality.vim
+  LeaderF
+  fzf
+  fzf.vim
+  AnsiEsc
+  baleia.nvim
+  image.nvim
+  vague.nvim
+  vim-ccls
+  gruvbox
+  vim-quantum
+  onedark.vim
+  vim-cpp-modern
+  vim-devicons
+)
+COC_EXTENSIONS=(
+  coc-json
+  coc-pyright
+  coc-tsserver
+  coc-java
+)
 
 export PATH="$HOME/.local/bin:$HOME/.atuin/bin:$HOME/.cargo/bin:$HOME/.npm-global/bin:$PATH"
 
@@ -35,7 +61,7 @@ Options:
   --yolo, --yes          Install selected components and overwrite without asking
   --overwrite, --force   Overwrite existing configs without prompts, but keep install prompts
   --terminal MODE        Terminal target: terminator (default), ghostty, both, none
-  --skip-neovim          Skip installing or upgrading neovim
+  --skip-neovim          Skip neovim install, config sync, plugins, and CoC extensions
   --skip-tmux            Skip installing or upgrading tmux
   --skip-tmux-compose    Skip tmux-compose helpers and user services
   --skip-atuin           Skip installing or upgrading atuin
@@ -493,11 +519,11 @@ install_terminator() {
 }
 
 install_base() {
-  if ! prompt_yes_no "Install base packages (curl git ripgrep fzf xsel unzip fontconfig python3)?" "y"; then
+  if ! prompt_yes_no "Install base packages (curl git ripgrep fzf xsel unzip fontconfig python3 build tools)?" "y"; then
     return 0
   fi
-  apt_install curl git ripgrep fzf xsel unzip fontconfig python3
-  apt_install_optional btop xclip wl-clipboard
+  apt_install curl git ripgrep fzf xsel unzip fontconfig python3 python3-dev python3-venv build-essential ca-certificates
+  apt_install_optional btop xclip wl-clipboard imagemagick
 }
 
 install_vim_plug() {
@@ -541,6 +567,53 @@ npm_global_install() {
   fi
 }
 
+verify_nvim_plugins() {
+  local missing=()
+  local plugin plugin_dir plugin_name dest
+
+  for plugin in "${NVIM_REMOTE_PLUGINS[@]}"; do
+    if [[ ! -d "$HOME/.local/share/nvim/plugged/$plugin" ]]; then
+      missing+=("plugged/$plugin")
+    fi
+  done
+
+  for plugin_dir in "$SCRIPT_DIR/setup_neovim/local_plugins"/*; do
+    [[ -d "$plugin_dir" ]] || continue
+    plugin_name="$(basename "$plugin_dir")"
+    dest="$HOME/.config/nvim/pack/local/start/$plugin_name"
+    if [[ ! -d "$dest" ]]; then
+      missing+=("pack/local/start/$plugin_name")
+    fi
+  done
+
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    echo "Neovim plugins verified."
+    return 0
+  fi
+
+  echo "ERROR: Missing Neovim plugins after install:"
+  printf '  - %s\n' "${missing[@]}"
+  echo "Re-run setup after checking network access and the Neovim/plugin install log above."
+  return 1
+}
+
+verify_coc_extensions() {
+  local missing=()
+  local ext
+  for ext in "${COC_EXTENSIONS[@]}"; do
+    if [[ ! -d "$HOME/.config/coc/extensions/node_modules/$ext" ]]; then
+      missing+=("$ext")
+    fi
+  done
+  if [[ "${#missing[@]}" -eq 0 ]]; then
+    echo "CoC extensions verified."
+    return 0
+  fi
+  echo "WARNING: Missing CoC extensions after install:"
+  printf '  - %s\n' "${missing[@]}"
+  return 1
+}
+
 run_plug_install() {
   local plug_path="$HOME/.local/share/nvim/site/autoload/plug.vim"
   if [[ ! -f "$plug_path" ]]; then
@@ -554,7 +627,34 @@ run_plug_install() {
       return 0
     fi
   fi
-  nvim --headless +PlugInstall +qall || true
+
+  echo "Installing/updating Neovim plugins with vim-plug."
+  if ! nvim --headless '+PlugInstall --sync' '+qall'; then
+    echo "WARNING: :PlugInstall failed; retrying once with :PlugUpdate."
+    nvim --headless '+PlugUpdate --sync' '+qall'
+  fi
+  verify_nvim_plugins
+}
+
+install_coc_extensions() {
+  if ! command -v nvim >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ ! -d "$HOME/.local/share/nvim/plugged/coc.nvim" ]]; then
+    return 0
+  fi
+  if [[ "$MODE" != "yolo" ]]; then
+    if ! prompt_yes_no "Install/update CoC extensions (${COC_EXTENSIONS[*]})?" "y"; then
+      return 0
+    fi
+  fi
+
+  echo "Installing/updating CoC extensions."
+  if ! nvim --headless "+CocInstall -sync ${COC_EXTENSIONS[*]}" '+qall'; then
+    echo "WARNING: CoC extension install failed."
+    return 1
+  fi
+  verify_coc_extensions || true
 }
 
 install_node_tooling() {
@@ -892,8 +992,10 @@ fi
 if [[ "$SKIP_GHOSTTY" -ne 1 ]]; then
   sync_ghostty
 fi
-sync_neovim
-install_vim_plug
+if [[ "$SKIP_NEOVIM" -ne 1 ]]; then
+  sync_neovim
+  install_vim_plug
+fi
 sync_atuin
 if [[ "$SKIP_BLESH" -ne 1 ]]; then
   sync_blesh
@@ -905,6 +1007,9 @@ fi
 reload_tmux_config
 sync_bash
 atuin_import_bash
-run_plug_install
+if [[ "$SKIP_NEOVIM" -ne 1 ]]; then
+  run_plug_install
+  install_coc_extensions
+fi
 
 echo "Done."

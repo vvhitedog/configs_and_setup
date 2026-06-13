@@ -1022,6 +1022,62 @@ COMMON_LUA = r"""
 state_dir = '<<STATE_DIR>>'
 script = '<<SCRIPT>>'
 
+function setup_compose_theme()
+    vim.opt.termguicolors = true
+    vim.opt.background = 'dark'
+    pcall(vim.cmd, 'colorscheme onedark')
+    local highlights = {
+        Normal = { fg = '#abb2bf', bg = '#1b2128' },
+        NormalFloat = { fg = '#abb2bf', bg = '#1b2128' },
+        CursorLine = { bg = '#2f3440' },
+        StatusLine = { fg = '#282c34', bg = '#abb2bf' },
+        StatusLineNC = { fg = '#abb2bf', bg = '#4b5263' },
+        VertSplit = { fg = '#4b5263', bg = '#1b2128' },
+        WinSeparator = { fg = '#4b5263', bg = '#1b2128' },
+        Title = { fg = '#abb2bf', bg = '#1b2128' },
+    }
+    for group, spec in pairs(highlights) do
+        pcall(vim.api.nvim_set_hl, 0, group, spec)
+    end
+end
+
+setup_compose_theme()
+
+function strip_ansi_codes(text)
+    text = text:gsub('\27%][^\7]*\7', '')
+    text = text:gsub('\27%][^\27]*\27\\', '')
+    text = text:gsub('\27%[[0-9;?]*[ -/]*[@-~]', '')
+    text = text:gsub('\27[@-_]', '')
+    return text
+end
+
+function apply_ansi_highlight_or_strip(bufnr)
+    bufnr = bufnr or 0
+    local ok, baleia = pcall(require, 'baleia')
+    if ok then
+        local applied = pcall(function()
+            baleia.setup({ async = false }).once(bufnr)
+        end)
+        if applied then return end
+    end
+
+    local was_modifiable = true
+    pcall(function()
+        was_modifiable = vim.api.nvim_buf_get_option(bufnr, 'modifiable')
+        if not was_modifiable then
+            vim.api.nvim_buf_set_option(bufnr, 'modifiable', true)
+        end
+    end)
+    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+    for i, line in ipairs(lines) do
+        lines[i] = strip_ansi_codes(line)
+    end
+    vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+    if not was_modifiable then
+        pcall(vim.api.nvim_buf_set_option, bufnr, 'modifiable', false)
+    end
+end
+
 function read_file(path)
     local f = io.open(path, 'r')
     if not f then return '' end
@@ -1071,8 +1127,7 @@ local function load_history()
     local lines = vim.split(content, '\n')
     vim.bo.modifiable = true
     vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
-    local ok, baleia = pcall(require, 'baleia')
-    if ok then baleia.setup({async = false}).once(0) end
+    apply_ansi_highlight_or_strip(0)
     vim.bo.modifiable = false
     vim.bo.buftype = 'nofile'
     vim.cmd('normal G')
@@ -1206,8 +1261,7 @@ local function update_preview()
     local content = tf:read('*a'); tf:close()
     vim.bo[preview_buf].modifiable = true
     vim.api.nvim_buf_set_lines(preview_buf, 0, -1, false, vim.split(content, '\n'))
-    local bok, bmod = pcall(require, 'baleia')
-    if bok then bmod.setup({async = false}).once(preview_buf) end
+    apply_ansi_highlight_or_strip(preview_buf)
     vim.bo[preview_buf].modifiable = false
     pcall(vim.api.nvim_win_set_cursor, preview_win,
         {vim.api.nvim_buf_line_count(preview_buf), 0})
