@@ -523,6 +523,8 @@ HELP_TEXT = r"""
   prefix+r  Back       Jump to previous pane (jumplist)
   prefix+f  Forward    Jump to next pane (jumplist)
   prefix+j  Jumplist   Pick from recent pane visits
+  prefix+c/C Create    New window in current pane directory
+  prefix+o  Split      Vertical split in current pane directory
   prefix+k  Fork       Fork current agent context in a new local window
   prefix+K  Worktree   Fork current agent context into a new git worktree
 

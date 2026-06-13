@@ -3,12 +3,27 @@ export FZF_DEFAULT_OPTS="--algo=v2 --scheme=history --tiebreak=chunk,begin,lengt
 export FZF_DEFAULT_COMMAND='rg --files --no-ignore --hidden --follow --glob "!.git/*"'
 bind -x '"\C-p": vim $(fzf);'
 
-export PATH="$HOME/.local/bin:$PATH"
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$HOME/.npm-global/bin:$PATH"
 export EDITOR=nvim
 
-. "$HOME/.atuin/bin/env"
-[[ -f ~/.bash-preexec.sh ]] && source ~/.bash-preexec.sh
-eval "$(atuin init bash)"
+if [[ -f "$HOME/.inputrc" ]]; then
+  export INPUTRC="$HOME/.inputrc"
+fi
 
-# Workaround for Ghostty cursor bug - re-exec bash once on startup
-[[ -z "$GHOSTTY_CURSOR_WORKAROUND" ]] && export GHOSTTY_CURSOR_WORKAROUND=1 && exec bash
+# Load ble.sh before Atuin so ble owns line editing and Atuin installs hooks after it.
+if [[ $- == *i* && -r "$HOME/.local/share/blesh/ble.sh" ]]; then
+  source -- "$HOME/.local/share/blesh/ble.sh"
+fi
+
+if [[ -r "$HOME/.atuin/bin/env" ]]; then
+  . "$HOME/.atuin/bin/env"
+fi
+if command -v atuin >/dev/null 2>&1; then
+  eval "$(atuin init bash)"
+fi
+
+# Workaround for Ghostty cursor bug - re-exec bash once on Ghostty startup only.
+if [[ -n "${GHOSTTY_RESOURCES_DIR:-}${GHOSTTY_BIN_DIR:-}" && -z "${GHOSTTY_CURSOR_WORKAROUND:-}" ]]; then
+  export GHOSTTY_CURSOR_WORKAROUND=1
+  exec bash
+fi

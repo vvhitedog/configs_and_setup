@@ -1,0 +1,85 @@
+# === Completion behavior ===
+bleopt complete_auto_complete=1
+bleopt complete_auto_history=1
+bleopt complete_auto_delay=100
+bleopt complete_auto_menu=300
+bleopt complete_menu_style=align-nowrap
+bleopt complete_menu_maxlines=15
+
+# === Color scheme — matches tmux muted dark palette ===
+# Palette (Nord-adjacent, matching tmux #2f3440 bg / #c8ced6 fg / cyan accent):
+#   blue:   #81a1c1   cyan:    #88c0d0   teal:   #8fbcbb
+#   green:  #a3be8c   yellow:  #ebcb8b   orange: #d08770
+#   red:    #bf616a   purple:  #b48ead   dim:    #636c7c
+#   fg:     #d8dee9   bright:  #eceff4
+
+# Auto-complete ghost text: dim italic, clearly not real input
+ble-face auto_complete='fg=#636c7c,italic'
+
+# Syntax
+ble-face syntax_default='fg=#d8dee9'
+ble-face syntax_command='fg=#81a1c1'
+ble-face syntax_quoted='fg=#a3be8c'
+ble-face syntax_quotation='fg=#a3be8c'
+ble-face syntax_escape='fg=#d08770'
+ble-face syntax_expr='fg=#ebcb8b'
+ble-face syntax_error='fg=#bf616a,bold'
+ble-face syntax_varname='fg=#b48ead'
+ble-face syntax_delimiter='fg=#81a1c1'
+ble-face syntax_param_expansion='fg=#b48ead'
+ble-face syntax_history_expansion='fg=#ebcb8b'
+ble-face syntax_function_name='fg=#88c0d0,bold'
+ble-face syntax_comment='fg=#636c7c,italic'
+ble-face syntax_glob='fg=#ebcb8b'
+ble-face syntax_brace='fg=#88c0d0'
+ble-face syntax_tilde='fg=#d08770'
+ble-face syntax_document='fg=#a3be8c'
+ble-face syntax_document_begin='fg=#a3be8c,bold'
+
+# Commands
+ble-face command_builtin_dot='fg=#88c0d0,bold'
+ble-face command_builtin='fg=#88c0d0'
+ble-face command_alias='fg=#8fbcbb'
+ble-face command_function='fg=#8fbcbb'
+ble-face command_file='fg=#d8dee9'
+ble-face command_keyword='fg=#81a1c1,bold'
+ble-face command_jobs='fg=#ebcb8b'
+ble-face command_directory='fg=#81a1c1,bold'
+ble-face command_suffix='fg=#a3be8c'
+ble-face command_suffix_new='fg=#a3be8c,bold'
+ble-face argument_option='fg=#d8dee9'
+ble-face argument_error='fg=#bf616a'
+
+# Filenames
+ble-face filename_directory='fg=#81a1c1,bold'
+ble-face filename_link='fg=#88c0d0'
+ble-face filename_orphan='fg=#bf616a,italic'
+ble-face filename_setuid='fg=#d08770,bold'
+ble-face filename_setgid='fg=#ebcb8b,bold'
+ble-face filename_executable='fg=#a3be8c,bold'
+ble-face filename_other='fg=#d8dee9'
+ble-face filename_socket='fg=#b48ead'
+ble-face filename_pipe='fg=#ebcb8b'
+ble-face filename_warning='fg=#bf616a,bold'
+ble-face filename_url='fg=#88c0d0,underline'
+
+# Variables
+ble-face varname_unset='fg=#636c7c'
+ble-face varname_export='fg=#b48ead,bold'
+ble-face varname_array='fg=#d08770'
+ble-face varname_hash='fg=#d08770'
+ble-face varname_number='fg=#ebcb8b'
+ble-face varname_readonly='fg=#b48ead,italic'
+ble-face varname_empty='fg=#636c7c'
+ble-face varname_expr='fg=#ebcb8b'
+ble-face varname_new='fg=#a3be8c'
+
+# Selection — matches tmux mode-style
+ble-face region='fg=#eceff4,bg=#3f4758'
+ble-face region_target='fg=#eceff4,bg=#434c5e'
+ble-face region_match='fg=#eceff4,bg=#5e81ac'
+ble-face region_insert='fg=#eceff4,bg=#3f4758'
+
+# Disabled / overwrite
+ble-face disabled='fg=#636c7c'
+ble-face overwrite_mode='fg=#d08770'

@@ -11,6 +11,7 @@ SKIP_NEOVIM=0
 SKIP_TMUX=0
 SKIP_TMUX_COMPOSE=0
 SKIP_ATUIN=0
+SKIP_BLESH=0
 SKIP_TERMINATOR=0
 SKIP_GHOSTTY=1
 SKIP_BASE=0
@@ -38,6 +39,7 @@ Options:
   --skip-tmux            Skip installing or upgrading tmux
   --skip-tmux-compose    Skip tmux-compose helpers and user services
   --skip-atuin           Skip installing or upgrading atuin
+  --skip-blesh           Skip installing or syncing ble.sh and .blerc
   --skip-terminator      Skip installing or syncing terminator
   --skip-ghostty         Skip installing or syncing ghostty
   --skip-base            Skip installing base packages
@@ -387,6 +389,37 @@ install_tmux() {
   apt_install tmux
 }
 
+install_blesh() {
+  local ble_path="$HOME/.local/share/blesh/ble.sh"
+  local tmp=""
+
+  if [[ -f "$ble_path" ]]; then
+    if ! prompt_yes_no "ble.sh already installed. Reinstall/update from source?" "n"; then
+      return 0
+    fi
+  else
+    if ! prompt_yes_no "Install ble.sh from source?" "y"; then
+      return 0
+    fi
+  fi
+
+  ensure_command git git || return 0
+  ensure_command make make || return 0
+  ensure_command gawk gawk || return 0
+
+  tmp="$(mktemp -d)"
+  if git clone --recursive --depth 1 --shallow-submodules \
+      https://github.com/akinomyoga/ble.sh.git "$tmp/ble.sh" && \
+      make -C "$tmp/ble.sh" install PREFIX="$HOME/.local"; then
+    rm -rf "$tmp"
+  else
+    local rc=$?
+    rm -rf "$tmp"
+    echo "WARNING: ble.sh install failed."
+    return "$rc"
+  fi
+}
+
 install_atuin() {
   if command -v atuin >/dev/null 2>&1; then
     if ! prompt_yes_no "Atuin already installed. Reinstall/upgrade?" "y"; then
@@ -601,6 +634,23 @@ sync_tmux() {
   copy_file "$SCRIPT_DIR/setup_tmux/tmux.conf" "$HOME/.tmux.conf" "tmux config"
 }
 
+reload_tmux_config() {
+  if [[ -z "${TMUX:-}" ]]; then
+    return 0
+  fi
+  if ! command -v tmux >/dev/null 2>&1; then
+    return 0
+  fi
+  if [[ "$MODE" != "yolo" && "$OVERWRITE" -ne 1 ]]; then
+    if ! prompt_yes_no "Reload the running tmux server config now?" "y"; then
+      return 0
+    fi
+  fi
+  if ! tmux source-file "$HOME/.tmux.conf"; then
+    echo "WARNING: failed to reload tmux config. New tmux sessions will still use ~/.tmux.conf."
+  fi
+}
+
 sync_tmux_compose() {
   local bin_src_dir="$SCRIPT_DIR/setup_tmux/bin"
   local unit_src_dir="$SCRIPT_DIR/setup_tmux/systemd/user"
@@ -657,6 +707,10 @@ sync_tmux_compose() {
 
 sync_atuin() {
   copy_file "$SCRIPT_DIR/setup_atuin/config.toml" "$HOME/.config/atuin/config.toml" "atuin config"
+}
+
+sync_blesh() {
+  copy_file "$SCRIPT_DIR/setup_bash/blerc" "$HOME/.blerc" "ble.sh config"
 }
 
 sync_bash() {
@@ -721,6 +775,7 @@ print_summary() {
   echo "  mode: $MODE"
   echo "  overwrite configs: $([[ "$MODE" == "yolo" || "$OVERWRITE" -eq 1 ]] && echo yes || echo prompt)"
   echo "  terminals: $(selected_terminals)"
+  echo "  ble.sh: $([[ "$SKIP_BLESH" -ne 1 ]] && echo enabled || echo skipped)"
   echo "  tmux-compose services: $([[ "$ENABLE_SYSTEMD" -eq 1 && "$SKIP_TMUX_COMPOSE" -ne 1 ]] && echo enabled || echo disabled)"
 }
 
@@ -771,6 +826,7 @@ while [[ $# -gt 0 ]]; do
     --skip-tmux) SKIP_TMUX=1 ;;
     --skip-tmux-compose) SKIP_TMUX_COMPOSE=1 ;;
     --skip-atuin) SKIP_ATUIN=1 ;;
+    --skip-blesh) SKIP_BLESH=1 ;;
     --skip-terminator) SKIP_TERMINATOR=1 ;;
     --skip-ghostty) SKIP_GHOSTTY=1 ;;
     --skip-base) SKIP_BASE=1 ;;
@@ -804,6 +860,9 @@ fi
 if [[ "$SKIP_ATUIN" -ne 1 ]]; then
   install_atuin
 fi
+if [[ "$SKIP_BLESH" -ne 1 ]]; then
+  install_blesh
+fi
 if [[ "$SKIP_TERMINATOR" -ne 1 ]]; then
   install_terminator
 fi
@@ -823,10 +882,14 @@ fi
 sync_neovim
 install_vim_plug
 sync_atuin
+if [[ "$SKIP_BLESH" -ne 1 ]]; then
+  sync_blesh
+fi
 sync_tmux
 if [[ "$SKIP_TMUX_COMPOSE" -ne 1 ]]; then
   sync_tmux_compose
 fi
+reload_tmux_config
 sync_bash
 atuin_import_bash
 run_plug_install
