@@ -20,7 +20,7 @@ Configurations and setup scripts to sync my current environment.
 
 ## Setup script (Ubuntu)
 `setup_ubuntu.sh` is opt-out and idempotent enough to run over an older install.
-It skips copies that are already identical, prompts before overwriting in interview mode, and supports explicit hands-off overwrite.
+It skips copies that are already identical, prompts before overwriting in interview mode, and supports explicit hands-off overwrite. The script prints numbered progress steps, hides noisy installer output in per-run logs under `/tmp`, and always prints a final success/failure summary with the failed step when something exits nonzero.
 
 Modes:
 - interview mode (default): asks about installs and overwrites

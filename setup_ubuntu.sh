@@ -52,6 +52,129 @@ COC_EXTENSIONS=(
 
 export PATH="$HOME/.local/bin:$HOME/.atuin/bin:$HOME/.cargo/bin:$HOME/.npm-global/bin:$PATH"
 
+
+LOG_DIR=""
+STEP_TOTAL=0
+STEP_INDEX=0
+CURRENT_STEP=""
+INSTALL_STARTED_AT="$(date +%s)"
+COMPLETED_STEPS=()
+COPIED_ITEMS=0
+UPTODATE_ITEMS=0
+DECLINED_ITEMS=0
+
+ensure_log_dir() {
+  if [[ -z "$LOG_DIR" ]]; then
+    LOG_DIR="$(mktemp -d /tmp/configs_and_setup.XXXXXX)"
+  fi
+}
+
+log_file_for() {
+  local label="$1"
+  local safe
+  safe="$(printf '%s' "$label" | tr -cs 'A-Za-z0-9._-' '_')"
+  ensure_log_dir
+  printf '%s/%02d-%s.log' "$LOG_DIR" "$STEP_INDEX" "$safe"
+}
+
+run_logged() {
+  local label="$1"
+  shift
+  local log
+  log="$(log_file_for "$label")"
+  printf '    %s\n' "$label"
+  if "$@" >"$log" 2>&1; then
+    printf '      ok\n'
+    return 0
+  fi
+  local rc=$?
+  printf '      failed (exit %s). Log: %s\n' "$rc" "$log"
+  return "$rc"
+}
+
+ensure_sudo() {
+  if ! command -v sudo >/dev/null 2>&1; then
+    return 0
+  fi
+  if sudo -n true >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "    sudo access is required; enter your password if prompted."
+  sudo -v
+}
+
+build_step_total() {
+  STEP_TOTAL=0
+  [[ "$SKIP_BASE" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
+  if [[ "$SKIP_NEOVIM" -ne 1 ]]; then
+    STEP_TOTAL=$((STEP_TOTAL + 2))
+  fi
+  [[ "$SKIP_TMUX" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
+  [[ "$SKIP_ATUIN" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
+  [[ "$SKIP_BLESH" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
+  [[ "$SKIP_TERMINATOR" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
+  [[ "$SKIP_GHOSTTY" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
+  [[ "$SKIP_FONTS" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
+  [[ "$SKIP_TERMINATOR" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
+  [[ "$SKIP_GHOSTTY" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
+  if [[ "$SKIP_NEOVIM" -ne 1 ]]; then
+    STEP_TOTAL=$((STEP_TOTAL + 2))
+  fi
+  [[ "$SKIP_ATUIN" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
+  [[ "$SKIP_BLESH" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
+  STEP_TOTAL=$((STEP_TOTAL + 1))
+  [[ "$SKIP_TMUX_COMPOSE" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
+  STEP_TOTAL=$((STEP_TOTAL + 2))
+  [[ "$SKIP_ATUIN" -eq 1 ]] || STEP_TOTAL=$((STEP_TOTAL + 1))
+  if [[ "$SKIP_NEOVIM" -ne 1 ]]; then
+    STEP_TOTAL=$((STEP_TOTAL + 2))
+  fi
+}
+
+run_step() {
+  local label="$1"
+  shift
+  STEP_INDEX=$((STEP_INDEX + 1))
+  CURRENT_STEP="$label"
+  local remaining=$((STEP_TOTAL - STEP_INDEX))
+  printf '\n[%02d/%02d] %s (%d left)\n' "$STEP_INDEX" "$STEP_TOTAL" "$label" "$remaining"
+  "$@"
+  COMPLETED_STEPS+=("$label")
+  CURRENT_STEP=""
+}
+
+print_final_summary() {
+  local rc=$?
+  trap - EXIT
+  local ended elapsed status
+  ended="$(date +%s)"
+  elapsed=$((ended - INSTALL_STARTED_AT))
+
+  echo
+  echo "== configs_and_setup summary =="
+  if [[ "$rc" -eq 0 ]]; then
+    status="SUCCESS"
+  else
+    status="FAILED (exit $rc)"
+  fi
+  echo "Status: $status"
+  echo "Completed steps: ${#COMPLETED_STEPS[@]}/${STEP_TOTAL}"
+  if [[ "$rc" -ne 0 && -n "$CURRENT_STEP" ]]; then
+    echo "Failed step: [$STEP_INDEX/$STEP_TOTAL] $CURRENT_STEP"
+  fi
+  echo "Config copies: $COPIED_ITEMS updated, $UPTODATE_ITEMS already current, $DECLINED_ITEMS skipped by choice"
+  echo "Elapsed: ${elapsed}s"
+  if [[ -n "$LOG_DIR" && -d "$LOG_DIR" ]]; then
+    echo "Detailed logs: $LOG_DIR"
+  fi
+  if [[ "$rc" -eq 0 ]]; then
+    echo "Install completed successfully."
+  else
+    echo "Install did not complete. Check the failed step and logs above."
+  fi
+  exit "$rc"
+}
+
 usage() {
   cat <<'EOF'
 Usage: setup_ubuntu.sh [options]
@@ -64,7 +187,7 @@ Options:
   --skip-neovim          Skip neovim install, config sync, plugins, and CoC extensions
   --skip-tmux            Skip installing or upgrading tmux
   --skip-tmux-compose    Skip tmux-compose helpers and user services
-  --skip-atuin           Skip installing or upgrading atuin
+  --skip-atuin           Skip installing, syncing, and importing atuin
   --skip-blesh           Skip installing or syncing ble.sh and .blerc
   --skip-terminator      Skip installing or syncing terminator
   --skip-ghostty         Skip installing or syncing ghostty
@@ -105,14 +228,16 @@ prompt_yes_no() {
 
 maybe_apt_update() {
   if [[ "$APT_UPDATED" -eq 0 ]]; then
-    sudo apt-get update
+    ensure_sudo
+    run_logged "apt-get update" sudo apt-get update
     APT_UPDATED=1
   fi
 }
 
 apt_install() {
   maybe_apt_update
-  sudo apt-get install -y "$@"
+  ensure_sudo
+  run_logged "apt-get install $*" sudo apt-get install -y "$@"
 }
 
 apt_has_pkg() {
@@ -213,9 +338,17 @@ get_yarn_version() {
 copy_file_unprompted() {
   local src="$1"
   local dest="$2"
+  local dest_dir
+  dest_dir="$(dirname "$dest")"
 
-  mkdir -p "$(dirname "$dest")"
-  cp -a "$src" "$dest"
+  if ! mkdir -p "$dest_dir" 2>/dev/null; then
+    echo "ERROR: failed to create destination directory: $dest_dir"
+    return 1
+  fi
+  if ! cp -a "$src" "$dest" 2>/dev/null; then
+    echo "ERROR: failed to copy $src to $dest"
+    return 1
+  fi
 }
 
 copy_file() {
@@ -229,23 +362,30 @@ copy_file() {
   fi
 
   if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
-    echo "$label is already up to date: $dest"
+    UPTODATE_ITEMS=$((UPTODATE_ITEMS + 1))
+    echo "    already current: $label"
     return 0
   fi
 
   if [[ "$MODE" != "yolo" && "$OVERWRITE" -ne 1 ]]; then
     if [[ -e "$dest" ]]; then
       if ! prompt_yes_no "Overwrite $label at $dest?" "y"; then
+        DECLINED_ITEMS=$((DECLINED_ITEMS + 1))
+        echo "    skipped by choice: $label"
         return 0
       fi
     else
       if ! prompt_yes_no "Install $label to $dest?" "y"; then
+        DECLINED_ITEMS=$((DECLINED_ITEMS + 1))
+        echo "    skipped by choice: $label"
         return 0
       fi
     fi
   fi
 
   copy_file_unprompted "$src" "$dest"
+  COPIED_ITEMS=$((COPIED_ITEMS + 1))
+  echo "    updated: $label"
 }
 
 copy_dir() {
@@ -259,18 +399,23 @@ copy_dir() {
   fi
 
   if [[ -d "$dest" ]] && command -v diff >/dev/null 2>&1 && diff -qr "$src" "$dest" >/dev/null 2>&1; then
-    echo "$label is already up to date: $dest"
+    UPTODATE_ITEMS=$((UPTODATE_ITEMS + 1))
+    echo "    already current: $label"
     return 0
   fi
 
   if [[ "$MODE" != "yolo" && "$OVERWRITE" -ne 1 ]]; then
     if [[ -e "$dest" ]]; then
       if ! prompt_yes_no "Overwrite $label at $dest?" "y"; then
+        DECLINED_ITEMS=$((DECLINED_ITEMS + 1))
+        echo "    skipped by choice: $label"
         return 0
       fi
       rm -rf "$dest"
     else
       if ! prompt_yes_no "Install $label to $dest?" "y"; then
+        DECLINED_ITEMS=$((DECLINED_ITEMS + 1))
+        echo "    skipped by choice: $label"
         return 0
       fi
     fi
@@ -280,8 +425,18 @@ copy_dir() {
     fi
   fi
 
-  mkdir -p "$(dirname "$dest")"
-  cp -a "$src" "$dest"
+  local dest_dir
+  dest_dir="$(dirname "$dest")"
+  if ! mkdir -p "$dest_dir" 2>/dev/null; then
+    echo "ERROR: failed to create destination directory: $dest_dir"
+    return 1
+  fi
+  if ! cp -a "$src" "$dest" 2>/dev/null; then
+    echo "ERROR: failed to copy $src to $dest"
+    return 1
+  fi
+  COPIED_ITEMS=$((COPIED_ITEMS + 1))
+  echo "    updated: $label"
 }
 
 diff_line_count() {
@@ -396,7 +551,8 @@ install_neovim() {
 
   if [[ "$recommended_source" == "snap" ]]; then
     ensure_command snap snapd || return 0
-    sudo snap install nvim --classic
+    ensure_sudo
+    run_logged "snap install nvim" sudo snap install nvim --classic
   else
     apt_install neovim
   fi
@@ -434,9 +590,9 @@ install_blesh() {
   ensure_command gawk gawk || return 0
 
   tmp="$(mktemp -d)"
-  if git clone --recursive --depth 1 --shallow-submodules \
+  if run_logged "clone ble.sh" git clone --recursive --depth 1 --shallow-submodules \
       https://github.com/akinomyoga/ble.sh.git "$tmp/ble.sh" && \
-      make -C "$tmp/ble.sh" install PREFIX="$HOME/.local"; then
+      run_logged "install ble.sh" make -C "$tmp/ble.sh" install PREFIX="$HOME/.local"; then
     rm -rf "$tmp"
   else
     local rc=$?
@@ -470,10 +626,10 @@ install_atuin() {
 
   local tmp=""
   tmp="$(mktemp -d)"
-  echo "Installing atuin via the release binary installer (no shell config mutation)."
-  if curl -fsSL --retry 3 -o "$tmp/atuin-installer.sh" \
+  echo "    using Atuin release binary installer without shell mutation"
+  if run_logged "download Atuin installer" curl -fsSL --retry 3 -o "$tmp/atuin-installer.sh" \
       https://github.com/atuinsh/atuin/releases/latest/download/atuin-installer.sh && \
-      ATUIN_NO_MODIFY_PATH=1 ATUIN_DISABLE_UPDATE=1 \
+      run_logged "install Atuin" env ATUIN_NO_MODIFY_PATH=1 ATUIN_DISABLE_UPDATE=1 \
         sh "$tmp/atuin-installer.sh" --quiet --no-modify-path; then
     rm -rf "$tmp"
   else
@@ -502,7 +658,8 @@ install_ghostty() {
 
   echo "Ghostty package not found in apt. Trying snap."
   ensure_command snap snapd || return 0
-  sudo snap install ghostty --classic
+  ensure_sudo
+  run_logged "snap install ghostty" sudo snap install ghostty --classic
 }
 
 install_terminator() {
@@ -543,14 +700,14 @@ install_vim_plug() {
     return 0
   fi
 
-  bash "$SCRIPT_DIR/setup_neovim/install_vim_plug"
+  run_logged "install vim-plug" bash "$SCRIPT_DIR/setup_neovim/install_vim_plug"
 }
 
 npm_global_install() {
   local pkg="$1"
   local log=""
   ensure_dir "$NPM_PREFIX"
-  log="$(mktemp)"
+  log="$(log_file_for "npm install $pkg")"
   if npm install -g "$pkg" --prefix "$NPM_PREFIX" >"$log" 2>&1; then
     rm -f "$log"
     return 0
@@ -558,7 +715,8 @@ npm_global_install() {
   echo "npm install -g $pkg failed under ${NPM_PREFIX}. See $log"
   if prompt_yes_no "Retry npm install -g $pkg with sudo?" "n"; then
     local sudo_log
-    sudo_log="$(mktemp)"
+    ensure_sudo
+    sudo_log="$(log_file_for "sudo npm install $pkg")"
     if sudo npm install -g "$pkg" >"$sudo_log" 2>&1; then
       rm -f "$sudo_log"
     else
@@ -628,10 +786,10 @@ run_plug_install() {
     fi
   fi
 
-  echo "Installing/updating Neovim plugins with vim-plug."
-  if ! nvim --headless '+PlugInstall --sync' '+qall'; then
+  echo "    installing/updating Neovim plugins with vim-plug"
+  if ! run_logged "nvim PlugInstall" nvim --headless '+PlugInstall --sync' '+qall'; then
     echo "WARNING: :PlugInstall failed; retrying once with :PlugUpdate."
-    nvim --headless '+PlugUpdate --sync' '+qall'
+    run_logged "nvim PlugUpdate retry" nvim --headless '+PlugUpdate --sync' '+qall'
   fi
   verify_nvim_plugins
 }
@@ -649,8 +807,8 @@ install_coc_extensions() {
     fi
   fi
 
-  echo "Installing/updating CoC extensions."
-  if ! nvim --headless "+CocInstall -sync ${COC_EXTENSIONS[*]}" '+qall'; then
+  echo "    installing/updating CoC extensions"
+  if ! run_logged "nvim CocInstall" nvim --headless "+CocInstall -sync ${COC_EXTENSIONS[*]}" '+qall'; then
     echo "WARNING: CoC extension install failed."
     return 1
   fi
@@ -669,7 +827,11 @@ install_node_tooling() {
     echo "CoC requires Node.js >= ${MIN_NODE_VERSION}."
     if prompt_yes_no "Install Node.js LTS via NodeSource (adds apt repo)?" "y"; then
       ensure_command curl curl || return 0
-      curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+      local nodesource_script
+      nodesource_script="$(log_file_for "nodesource setup script")"
+      run_logged "download NodeSource setup" curl -fsSL -o "$nodesource_script" https://deb.nodesource.com/setup_20.x
+      ensure_sudo
+      run_logged "configure NodeSource apt repo" sudo -E bash "$nodesource_script"
       apt_install nodejs
       node_ver="$(get_node_version)"
       npm_ver="$(get_npm_version)"
@@ -690,18 +852,11 @@ install_node_tooling() {
   if [[ -z "$yarn_ver" ]] || ! version_ge "$yarn_ver" "$MIN_YARN_VERSION"; then
     if command -v corepack >/dev/null 2>&1; then
       if prompt_yes_no "Enable corepack and install Yarn (stable)?" "y"; then
-        local cp_log
-        cp_log="$(mktemp)"
-        if ! corepack enable >"$cp_log" 2>&1; then
-          echo "corepack enable failed. See $cp_log"
-        else
-          rm -f "$cp_log"
+        if ! run_logged "enable corepack" corepack enable; then
+          echo "corepack enable failed."
         fi
-        cp_log="$(mktemp)"
-        if ! corepack prepare yarn@stable --activate >"$cp_log" 2>&1; then
-          echo "corepack prepare failed. See $cp_log"
-        else
-          rm -f "$cp_log"
+        if ! run_logged "prepare Yarn via corepack" corepack prepare yarn@stable --activate; then
+          echo "corepack prepare failed."
         fi
       fi
     else
@@ -731,7 +886,7 @@ install_fonts() {
   mkdir -p "$dest_dir"
   unzip -o "$zip_path" -d "$dest_dir" >/dev/null
   if command -v fc-cache >/dev/null 2>&1; then
-    fc-cache -f "$dest_dir" || true
+    run_logged "refresh font cache" fc-cache -f "$dest_dir" || true
   fi
 }
 
@@ -809,11 +964,11 @@ sync_tmux_compose() {
     fi
   fi
 
-  if ! systemctl --user daemon-reload; then
+  if ! run_logged "systemctl user daemon-reload" systemctl --user daemon-reload; then
     echo "WARNING: systemctl --user daemon-reload failed; user services were not enabled."
     return 0
   fi
-  if ! systemctl --user enable --now tmux-pane-history.service tmux-window-usage.service tmux-compose-snapshot.timer; then
+  if ! run_logged "enable tmux-compose user services" systemctl --user enable --now tmux-pane-history.service tmux-window-usage.service tmux-compose-snapshot.timer; then
     echo "WARNING: failed to enable/start one or more tmux-compose user units."
   fi
 }
@@ -867,7 +1022,7 @@ atuin_import_bash() {
     return 0
   fi
   if [[ "$MODE" == "yolo" ]] || prompt_yes_no "Import default bash history into atuin now?" "y"; then
-    atuin import bash || true
+    run_logged "atuin import bash history" atuin import bash || true
   fi
 }
 
@@ -886,10 +1041,12 @@ selected_terminals() {
 print_summary() {
   echo "configs_and_setup install"
   echo "  mode: $MODE"
+  echo "  planned steps: $STEP_TOTAL"
   echo "  overwrite configs: $([[ "$MODE" == "yolo" || "$OVERWRITE" -eq 1 ]] && echo yes || echo prompt)"
   echo "  terminals: $(selected_terminals)"
   echo "  ble.sh: $([[ "$SKIP_BLESH" -ne 1 ]] && echo enabled || echo skipped)"
   echo "  tmux-compose services: $([[ "$ENABLE_SYSTEMD" -eq 1 && "$SKIP_TMUX_COMPOSE" -ne 1 ]] && echo enabled || echo disabled)"
+  echo "  noisy command output: hidden unless a step fails; log path is shown in the final summary"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -958,58 +1115,62 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+build_step_total
+trap print_final_summary EXIT
 print_summary
 
 if [[ "$SKIP_BASE" -ne 1 ]]; then
-  install_base
+  run_step "Install base packages" install_base
 fi
 if [[ "$SKIP_NEOVIM" -ne 1 ]]; then
-  install_neovim
-  install_node_tooling
+  run_step "Install or upgrade Neovim" install_neovim
+  run_step "Install Node.js/npm/Yarn tooling" install_node_tooling
 fi
 if [[ "$SKIP_TMUX" -ne 1 ]]; then
-  install_tmux
+  run_step "Install or upgrade tmux" install_tmux
 fi
 if [[ "$SKIP_ATUIN" -ne 1 ]]; then
-  install_atuin
+  run_step "Install or upgrade Atuin" install_atuin
 fi
 if [[ "$SKIP_BLESH" -ne 1 ]]; then
-  install_blesh
+  run_step "Install or update ble.sh" install_blesh
 fi
 if [[ "$SKIP_TERMINATOR" -ne 1 ]]; then
-  install_terminator
+  run_step "Install or upgrade Terminator" install_terminator
 fi
 if [[ "$SKIP_GHOSTTY" -ne 1 ]]; then
-  install_ghostty
+  run_step "Install or upgrade Ghostty" install_ghostty
 fi
 if [[ "$SKIP_FONTS" -ne 1 ]]; then
-  install_fonts
+  run_step "Install Sauce Code Pro fonts" install_fonts
 fi
 
 if [[ "$SKIP_TERMINATOR" -ne 1 ]]; then
-  sync_terminator
+  run_step "Sync Terminator config" sync_terminator
 fi
 if [[ "$SKIP_GHOSTTY" -ne 1 ]]; then
-  sync_ghostty
+  run_step "Sync Ghostty config" sync_ghostty
 fi
 if [[ "$SKIP_NEOVIM" -ne 1 ]]; then
-  sync_neovim
-  install_vim_plug
+  run_step "Sync Neovim config and local plugins" sync_neovim
+  run_step "Install or update vim-plug" install_vim_plug
 fi
-sync_atuin
+if [[ "$SKIP_ATUIN" -ne 1 ]]; then
+  run_step "Sync Atuin config" sync_atuin
+fi
 if [[ "$SKIP_BLESH" -ne 1 ]]; then
-  sync_blesh
+  run_step "Sync ble.sh config" sync_blesh
 fi
-sync_tmux
+run_step "Sync tmux config" sync_tmux
 if [[ "$SKIP_TMUX_COMPOSE" -ne 1 ]]; then
-  sync_tmux_compose
+  run_step "Sync tmux-compose helpers and services" sync_tmux_compose
 fi
-reload_tmux_config
-sync_bash
-atuin_import_bash
+run_step "Reload running tmux config" reload_tmux_config
+run_step "Sync bash config" sync_bash
+if [[ "$SKIP_ATUIN" -ne 1 ]]; then
+  run_step "Import bash history into Atuin" atuin_import_bash
+fi
 if [[ "$SKIP_NEOVIM" -ne 1 ]]; then
-  run_plug_install
-  install_coc_extensions
+  run_step "Install or update Neovim plugins" run_plug_install
+  run_step "Install or update CoC extensions" install_coc_extensions
 fi
-
-echo "Done."
