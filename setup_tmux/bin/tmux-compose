@@ -11,6 +11,7 @@ import subprocess
 import sys
 import sqlite3
 import tempfile
+import time
 from datetime import datetime
 
 DB_PATH = os.path.expanduser("~/.cache/tmux/pane-history.db")
@@ -100,6 +101,8 @@ Modes:
 Common options:
   --cwd DIR             Source directory. Defaults to the current tmux pane path
                         when run inside tmux, otherwise the process cwd.
+  --pane-id ID          Source tmux pane id. Used by keybindings for pane-aware
+                        session selection.
   -n, --name NAME       New tmux window name and Codex thread-title seed.
                         Blank/omitted uses a generated name based on the mode
                         and cwd.
@@ -119,10 +122,12 @@ Agent behavior:
   codex   Uses native Codex forking. tmux-compose seeds the terminal
           title with the fork window name before launching Codex so the saved
           thread is named for that fork. By default it reads Codex session metadata,
-          finds the newest recorded session whose cwd matches --cwd, and runs
-          codex fork <SESSION_ID> -C <target-dir>. If no matching session is
-          found, it falls back to codex fork --all --last -C <target-dir> so
-          the target directory does not filter out the origin transcript.
+          first tries to match the source tmux pane's Codex process to a saved
+          session, then falls back to sessions whose cwd matches --cwd. Empty
+          fork shells are resolved back to the nearest transcript-bearing
+          ancestor. If no matching session is found, it falls back to codex fork
+          --all --last -C <target-dir> so the target directory does not filter
+          out the origin transcript.
 
   claude  Best-effort fallback: claude --continue --fork-session, launched in
           the target directory. Claude does not expose the same cwd-filtered
@@ -199,42 +204,262 @@ def _default_window_name(mode, cwd, name):
 
 
 CODEX_SESSIONS_DIR = os.path.expanduser("~/.codex/sessions")
+_PANE_SESSION_TIME_SLOP_SECONDS = 120
+_CODEX_EMPTY_USER_RE = re.compile(
+    r"^<user_shell_command>\s*<command>.*?</command>\s*<result>.*?</result>\s*</user_shell_command>$",
+    re.DOTALL,
+)
+_CODEX_DEVICE_REPLY_PROMPT_RE = re.compile(r"^\s*›\s*\??[0-9][0-9;]*c\s*$")
 
 
-def _latest_codex_session_id_for_cwd(cwd):
-    if not cwd:
+def _codex_message_text(payload):
+    parts = []
+    for item in payload.get("content") or []:
+        if isinstance(item, dict):
+            parts.append(item.get("text") or "")
+    return "".join(parts).strip()
+
+
+def _parse_iso_epoch(ts):
+    if not ts:
         return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _codex_session_summary(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            meta = json.loads(f.readline())
+            if meta.get("type") != "session_meta":
+                return None
+            payload = meta.get("payload") or {}
+            session_cwd = payload.get("cwd")
+            session_id = payload.get("id")
+            if not session_cwd or not session_id:
+                return None
+
+            assistant_or_developer = 0
+            meaningful_user = 0
+            for line in f:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if record.get("type") != "response_item":
+                    continue
+                item = record.get("payload") or {}
+                if item.get("type") != "message":
+                    continue
+                role = item.get("role")
+                if role in ("assistant", "developer"):
+                    assistant_or_developer += 1
+                elif role == "user":
+                    text = _codex_message_text(item)
+                    if text and not _CODEX_EMPTY_USER_RE.match(text):
+                        meaningful_user += 1
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0
+
+    return {
+        "id": session_id,
+        "forked_from_id": payload.get("forked_from_id"),
+        "cwd": os.path.realpath(os.path.abspath(os.path.expanduser(session_cwd))),
+        "timestamp": payload.get("timestamp") or "",
+        "start_epoch": _parse_iso_epoch(payload.get("timestamp") or ""),
+        "mtime": mtime,
+        "has_transcript": assistant_or_developer > 0 or meaningful_user > 0,
+    }
+
+
+def _codex_session_summaries():
     root = CODEX_SESSIONS_DIR
     if not os.path.isdir(root):
-        return None
+        return []
 
-    wanted = os.path.realpath(os.path.abspath(os.path.expanduser(cwd)))
-    best = None
+    summaries = []
     for dirpath, _, filenames in os.walk(root):
         for filename in filenames:
             if not filename.endswith(".jsonl"):
                 continue
-            path = os.path.join(dirpath, filename)
-            try:
-                with open(path, encoding="utf-8") as f:
-                    record = json.loads(f.readline())
-                if record.get("type") != "session_meta":
-                    continue
-                payload = record.get("payload") or {}
-                session_cwd = payload.get("cwd")
-                session_id = payload.get("id")
-                if not session_cwd or not session_id:
-                    continue
-                session_cwd = os.path.realpath(
-                    os.path.abspath(os.path.expanduser(session_cwd)))
-                if session_cwd != wanted:
-                    continue
-                score = (os.path.getmtime(path), payload.get("timestamp") or "")
-                if best is None or score > best[0]:
-                    best = (score, session_id)
-            except (OSError, json.JSONDecodeError, TypeError, ValueError):
-                continue
+            summary = _codex_session_summary(os.path.join(dirpath, filename))
+            if summary:
+                summaries.append(summary)
+    return summaries
+
+
+def _latest_codex_session_id_for_cwd(cwd, summaries=None):
+    if not cwd:
+        return None
+
+    wanted = os.path.realpath(os.path.abspath(os.path.expanduser(cwd)))
+    best = None
+    for summary in summaries if summaries is not None else _codex_session_summaries():
+        if summary["cwd"] != wanted:
+            continue
+        # Empty fork shells can be newer than their useful parent. Prefer
+        # sessions that contain assistant/developer output or real user text.
+        score = (1 if summary["has_transcript"] else 0,
+                 summary["mtime"], summary["timestamp"])
+        if best is None or score > best[0]:
+            best = (score, summary["id"])
     return best[1] if best else None
+
+
+def _tmux_pane_pid(pane_id):
+    if not pane_id:
+        return None
+    r = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", pane_id, "#{pane_pid}"],
+        capture_output=True, text=True, timeout=5)
+    if r.returncode != 0:
+        return None
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _proc_ppid(pid):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            stat = f.read()
+    except OSError:
+        return None
+    end = stat.rfind(")")
+    if end == -1:
+        return None
+    parts = stat[end + 2:].split()
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+def _proc_start_epoch(pid):
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as f:
+            stat = f.read()
+        with open("/proc/stat", encoding="utf-8") as f:
+            btime = next(
+                int(line.split()[1]) for line in f if line.startswith("btime "))
+    except (OSError, StopIteration, ValueError):
+        return None
+
+    end = stat.rfind(")")
+    if end == -1:
+        return None
+    parts = stat[end + 2:].split()
+    if len(parts) < 20:
+        return None
+    try:
+        ticks = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
+        return btime + (int(parts[19]) / ticks)
+    except (KeyError, OSError, ValueError):
+        return None
+
+
+def _proc_cmd_basename(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+        args = [a.decode(errors="ignore") for a in raw.split(b"\0") if a]
+        if args:
+            return os.path.basename(args[0])
+    except OSError:
+        pass
+    try:
+        with open(f"/proc/{pid}/comm", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def _descendant_pids(root_pid):
+    parent_by_pid = {}
+    try:
+        pids = [int(name) for name in os.listdir("/proc") if name.isdigit()]
+    except OSError:
+        return [root_pid]
+    for pid in pids:
+        ppid = _proc_ppid(pid)
+        if ppid is not None:
+            parent_by_pid[pid] = ppid
+
+    descendants = {root_pid}
+    changed = True
+    while changed:
+        changed = False
+        for pid, ppid in parent_by_pid.items():
+            if ppid in descendants and pid not in descendants:
+                descendants.add(pid)
+                changed = True
+    return sorted(descendants)
+
+
+def _codex_session_id_for_pane(pane_id, cwd, summaries):
+    pane_pid = _tmux_pane_pid(pane_id)
+    if pane_pid is None:
+        return None
+
+    wanted = os.path.realpath(os.path.abspath(os.path.expanduser(cwd))) if cwd else None
+    codex_starts = []
+    for pid in _descendant_pids(pane_pid):
+        if _proc_cmd_basename(pid) != "codex":
+            continue
+        start = _proc_start_epoch(pid)
+        if start is not None:
+            codex_starts.append(start)
+    if not codex_starts:
+        return None
+
+    best = None
+    for summary in summaries:
+        if wanted and summary["cwd"] != wanted:
+            continue
+        if summary["start_epoch"] is None:
+            continue
+        delta = min(abs(summary["start_epoch"] - start) for start in codex_starts)
+        if delta > _PANE_SESSION_TIME_SLOP_SECONDS:
+            continue
+        score = (-delta, 1 if summary["has_transcript"] else 0,
+                 summary["mtime"], summary["timestamp"])
+        if best is None or score > best[0]:
+            best = (score, summary["id"])
+    return best[1] if best else None
+
+
+def _codex_session_id_for_fork(cwd, pane_id=None):
+    summaries = _codex_session_summaries()
+    session_id = (
+        _codex_session_id_for_pane(pane_id, cwd, summaries)
+        or _latest_codex_session_id_for_cwd(cwd, summaries)
+    )
+    return _codex_transcript_session_id(session_id, summaries)
+
+
+def _codex_transcript_session_id(session_id, summaries):
+    by_id = {summary["id"]: summary for summary in summaries}
+    seen = set()
+    current = session_id
+    while current and current not in seen:
+        seen.add(current)
+        summary = by_id.get(current)
+        if not summary:
+            return session_id
+        if summary["has_transcript"]:
+            return current
+        current = summary.get("forked_from_id")
+    return session_id
 
 
 def _agent_command(agent, target_dir, session_id=None, prompt=None, window_name=None):
@@ -266,6 +491,23 @@ def _agent_command(agent, target_dir, session_id=None, prompt=None, window_name=
 def _agent_shell_command(window_name, agent_cmd):
     safe_title = window_name.replace("\033", "").replace("\007", "")
     return f"printf '\033]0;%s\007' {shlex.quote(safe_title)}; exec {shlex.join(agent_cmd)}"
+
+
+def _clear_codex_startup_device_reply(pane_id):
+    # Some terminals answer Codex's startup device-attributes query before the
+    # TUI consumes it, leaving text like "65;6800;1c" in the composer.
+    for _ in range(12):
+        time.sleep(0.1)
+        r = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", pane_id, "-S", "-6"],
+            capture_output=True, text=True, timeout=5)
+        if r.returncode != 0:
+            return
+        lines = [line.rstrip() for line in r.stdout.splitlines()]
+        if any(_CODEX_DEVICE_REPLY_PROMPT_RE.match(line) for line in lines[-4:]):
+            subprocess.run(["tmux", "send-keys", "-t", pane_id, "C-u"],
+                           capture_output=True)
+            return
 
 
 def _launch_fork_window(window_name, target_dir, agent_cmd, quiet=False):
@@ -304,6 +546,8 @@ def _launch_fork_window(window_name, target_dir, agent_cmd, quiet=False):
 
     subprocess.run(["tmux", "select-window", "-t", window_id], capture_output=True)
     subprocess.run(["tmux", "select-pane", "-t", agent_pane], capture_output=True)
+    if agent_cmd and os.path.basename(agent_cmd[0]) == "codex":
+        _clear_codex_startup_device_reply(agent_pane)
     if not quiet:
         print(f"created {window_name}: agent pane {agent_pane}, shell pane {shell_pane}, cwd {target_dir}")
 
@@ -373,6 +617,7 @@ def _fork_parser():
     parser.add_argument("--agent", choices=("codex", "claude"), default="codex")
     parser.add_argument("--prompt", help="optional initial prompt for the forked agent")
     parser.add_argument("--session-id", help="Codex session id to fork instead of auto-detection")
+    parser.add_argument("--pane-id", help="source tmux pane id; passed by tmux keybindings")
     parser.add_argument("--branch", help="worktree mode: branch name to create")
     parser.add_argument("--path", dest="worktree_dir", help="worktree mode: physical worktree directory")
     parser.add_argument("--base", default="HEAD", help="worktree mode: base ref for git worktree add -b")
@@ -399,7 +644,7 @@ def cmd_fork(args):
 
     session_id = ns.session_id
     if ns.agent == "codex" and not session_id:
-        session_id = _latest_codex_session_id_for_cwd(cwd)
+        session_id = _codex_session_id_for_fork(cwd, ns.pane_id)
 
     agent_cmd = _agent_command(
         ns.agent, target_dir, session_id=session_id,
@@ -414,9 +659,12 @@ def cmd_fork_prompt(args):
         _fail("fork-prompt mode must be local or worktree")
     script = os.path.abspath(shutil.which(sys.argv[0]) or sys.argv[0])
     prompt = "fork window name:"
+    pane_id = args[2] if len(args) > 2 else ""
     fork_cmd = (
         f"{shlex.quote(script)} fork {mode} --cwd {shlex.quote(cwd)} "
         "--name '%1' --agent codex --quiet")
+    if pane_id:
+        fork_cmd += f" --pane-id {shlex.quote(pane_id)}"
     if mode == "worktree":
         prompt = "fork window name:,branch name:"
         fork_cmd += " --branch '%2'"
