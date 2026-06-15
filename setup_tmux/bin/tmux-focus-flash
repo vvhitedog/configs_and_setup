@@ -1,22 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-tmux has-session >/dev/null 2>&1 || exit 0
+socket_path="${1:-}"
+tmux_cmd=(tmux)
+if [[ -n "$socket_path" ]]; then
+  tmux_cmd=(tmux -S "$socket_path")
+fi
+
+"${tmux_cmd[@]}" has-session >/dev/null 2>&1 || exit 0
 
 token="$(date +%s%N)-$$"
 delay="${TMUX_FOCUS_FLASH_DELAY:-0.11}"
 
-tmux set-option -gq @focus_flash_token "$token" || exit 0
+"${tmux_cmd[@]}" set-option -gq @focus_flash_token "$token" || exit 0
 
 set_flash() {
   local value="$1"
   local current
 
-  current="$(tmux show-option -gqv @focus_flash_token 2>/dev/null || true)"
+  current="$("${tmux_cmd[@]}" show-option -gqv @focus_flash_token 2>/dev/null || true)"
   [[ "$current" == "$token" ]] || exit 0
 
-  tmux set-option -gq @focus_flash_on "$value" || exit 0
-  tmux refresh-client 2>/dev/null || true
+  "${tmux_cmd[@]}" set-option -gq @focus_flash_on "$value" || exit 0
+  "${tmux_cmd[@]}" refresh-client 2>/dev/null || true
 }
 
 set_flash 1
