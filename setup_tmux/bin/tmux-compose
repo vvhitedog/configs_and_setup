@@ -41,8 +41,8 @@ SERVICES = [
 ]
 
 # --- Settings -----------------------------------------------------------
-# Whether `create-window` / `create-split` should pop a `command-prompt`
-# asking for a window name after creating. Toggled from the status screen.
+# Legacy/default prompt behavior for create-window calls that do not pass an
+# explicit prompt mode. The tmux c/C bindings pass explicit modes.
 PROMPT_ON_CREATE_FILE = os.path.join(STATE_DIR, "prompt_on_create")
 
 
@@ -60,11 +60,22 @@ def set_prompt_on_create(val):
         f.write("on" if val else "off")
 
 
-def cmd_create_window(cwd, client=None):
-    """Bound to `prefix c/C`: new window inheriting cwd, optional name prompt."""
+def _should_prompt_for_create_window(prompt_mode=None):
+    if prompt_mode is None or prompt_mode in ("", "auto"):
+        return get_prompt_on_create()
+    normalized = prompt_mode.strip().lower()
+    if normalized in ("prompt", "ask", "on", "1", "true", "yes"):
+        return True
+    if normalized in ("no-prompt", "noprompt", "off", "0", "false", "no"):
+        return False
+    _fail(f"unknown create-window prompt mode: {prompt_mode}")
+
+
+def cmd_create_window(cwd, client=None, prompt_mode=None):
+    """Create a new window inheriting cwd, optionally prompting for a name."""
     cwd = cwd or os.path.expanduser("~")
     subprocess.run(["tmux", "new-window", "-c", cwd])
-    if get_prompt_on_create():
+    if _should_prompt_for_create_window(prompt_mode):
         cmd = ["tmux", "command-prompt", "-p", "name:"]
         if client:
             cmd.extend(["-t", client])
@@ -1584,15 +1595,15 @@ function refresh_status()
     table.insert(lines, '')
     table.insert(lines, ' Settings')
     table.insert(lines, ' ──────────────────────────────────────────')
-    table.insert(lines, ' prompt-on-create:  ' .. (prompt_state == 'on' and 'on ' or 'off')
-                                              .. '   (prompts for window name on prefix+c/C)')
+    table.insert(lines, ' create prompt default: ' .. (prompt_state == 'on' and 'on ' or 'off')
+                                              .. '   (manual default; prefix+c no prompt, prefix+C prompts)')
     table.insert(lines, ' codex auto-edits:  ' .. (codex_edits == 'on' and 'on ' or 'off')
                                               .. '   (codex-auto-approve edits prompts)')
     table.insert(lines, ' codex approve-all: ' .. (codex_appall == 'on' and 'on ' or 'off')
                                               .. '   (auto-approve ALL cmds except denylist)')
 
     table.insert(lines, '')
-    table.insert(lines, ' r=restart  s=start  p=prompt  e=edits  a=approve-all  R=refresh  qq=back')
+    table.insert(lines, ' r=restart  s=start  p=default-prompt  e=edits  a=approve-all  R=refresh  qq=back')
     vim.bo[status_buf].modifiable = true
     vim.api.nvim_buf_set_lines(status_buf, 0, -1, false, lines)
     vim.bo[status_buf].modifiable = false
@@ -1628,7 +1639,7 @@ vim.keymap.set('n', 'R', refresh_status, { buffer = status_buf, noremap = true }
 
 vim.keymap.set('n', 'p', function()
     local new_state = (vim.fn.system(script .. ' --toggle-prompt-on-create')):gsub('%s+', '')
-    vim.notify('prompt-on-create: ' .. new_state, vim.log.levels.INFO)
+    vim.notify('create prompt default: ' .. new_state, vim.log.levels.INFO)
     refresh_status()
 end, { buffer = status_buf, noremap = true })
 
@@ -1644,7 +1655,7 @@ vim.keymap.set('n', 'a', function()
     refresh_status()
 end, { buffer = status_buf, noremap = true })
 
-vim.wo.statusline = ' r=restart  s=start  p=prompt  e=edits  a=approve-all  R=refresh  │  qq=back'
+vim.wo.statusline = ' r=restart  s=start  p=default-prompt  e=edits  a=approve-all  R=refresh  │  qq=back'
 """
 
 HELP_LUA = r"""
@@ -2530,7 +2541,11 @@ def main():
     elif cmd == "reset":
         cmd_reset()
     elif cmd == "create-window" and len(sys.argv) >= 3:
-        cmd_create_window(sys.argv[2], sys.argv[3] if len(sys.argv) >= 4 else None)
+        cmd_create_window(
+            sys.argv[2],
+            sys.argv[3] if len(sys.argv) >= 4 else None,
+            sys.argv[4] if len(sys.argv) >= 5 else None,
+        )
     elif cmd == "create-split" and len(sys.argv) >= 3:
         cmd_create_split(sys.argv[2])
     elif cmd == "--toggle-prompt-on-create":
