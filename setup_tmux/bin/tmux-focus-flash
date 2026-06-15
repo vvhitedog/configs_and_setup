@@ -22,37 +22,51 @@ option_or_default() {
   fi
 }
 
-delay="${TMUX_FOCUS_FLASH_DELAY:-0.16}"
+delay="${TMUX_FOCUS_FLASH_DELAY:-0.10}"
 
 normal_pane_format="$(option_or_default @focus_flash_pane_format_normal '#{?pane_active,#[fg=black#{,}bg=white#{,}bold] [●] #{pane_index} #[default],#[fg=colour244#{,}bg=default] [○] #{pane_index} #[default]}')"
-flash_pane_format="$(option_or_default @focus_flash_pane_format_flash '#{?pane_active,#[fg=colour244#{,}bg=default] [●] #{pane_index} #[default],#[fg=colour244#{,}bg=default] [○] #{pane_index} #[default]}')"
+disabled_pane_format="$(option_or_default @focus_flash_pane_format_disabled '#{?pane_active,#[fg=colour244#{,}bg=default] [●] #{pane_index} #[default],#[fg=colour244#{,}bg=default] [○] #{pane_index} #[default]}')"
+cyan_pane_format="$(option_or_default @focus_flash_pane_format_cyan '#{?pane_active,#[fg=black#{,}bg=#56b6c2#{,}bold] [●] #{pane_index} #[default],#[fg=colour244#{,}bg=default] [○] #{pane_index} #[default]}')"
 normal_active_border_style="$(option_or_default @focus_flash_pane_active_border_style_normal 'fg=white,bg=default,bold')"
-flash_active_border_style="$(option_or_default @focus_flash_pane_active_border_style_flash 'fg=colour238,bg=default')"
+disabled_active_border_style="$(option_or_default @focus_flash_pane_active_border_style_disabled 'fg=colour238,bg=default')"
+cyan_active_border_style="$(option_or_default @focus_flash_pane_active_border_style_cyan 'fg=#56b6c2,bg=default,bold')"
 
 set_flash() {
   local state="$1"
   local pane_format
   local active_border_style
 
-  if [[ "$state" == "on" ]]; then
-    pane_format="$flash_pane_format"
-    active_border_style="$flash_active_border_style"
-  else
-    pane_format="$normal_pane_format"
-    active_border_style="$normal_active_border_style"
-  fi
+  case "$state" in
+    normal|white)
+      pane_format="$normal_pane_format"
+      active_border_style="$normal_active_border_style"
+      ;;
+    disabled)
+      pane_format="$disabled_pane_format"
+      active_border_style="$disabled_active_border_style"
+      ;;
+    cyan)
+      pane_format="$cyan_pane_format"
+      active_border_style="$cyan_active_border_style"
+      ;;
+    *)
+      pane_format="$normal_pane_format"
+      active_border_style="$normal_active_border_style"
+      ;;
+  esac
 
   "${tmux_cmd[@]}" set-option -gq pane-border-format "$pane_format" || true
   "${tmux_cmd[@]}" set-option -gq pane-active-border-style "$active_border_style" || true
   "${tmux_cmd[@]}" refresh-client 2>/dev/null || true
 }
 
-trap 'set_flash off' EXIT
+trap 'set_flash normal' EXIT
 
-set_flash on
-sleep "$delay"
-set_flash off
-sleep "$delay"
-set_flash on
-sleep "$delay"
-set_flash off
+states=(white disabled cyan disabled white disabled cyan disabled white)
+last_index=$((${#states[@]} - 1))
+for i in "${!states[@]}"; do
+  set_flash "${states[$i]}"
+  if (( i < last_index )); then
+    sleep "$delay"
+  fi
+done
