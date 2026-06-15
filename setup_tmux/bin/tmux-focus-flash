@@ -56,7 +56,7 @@ set_flash() {
 
 trap 'set_flash normal' EXIT
 
-states=(white disabled white disabled white disabled white)
+states=(white disabled white)
 last_index=$((${#states[@]} - 1))
 for i in "${!states[@]}"; do
   set_flash "${states[$i]}"
