@@ -9,26 +9,50 @@ fi
 
 "${tmux_cmd[@]}" has-session >/dev/null 2>&1 || exit 0
 
-token="$(date +%s%N)-$$"
-delay="${TMUX_FOCUS_FLASH_DELAY:-0.11}"
+option_or_default() {
+  local name="$1"
+  local default="$2"
+  local value
 
-"${tmux_cmd[@]}" set-option -gq @focus_flash_token "$token" || exit 0
+  value="$("${tmux_cmd[@]}" show-option -gqv "$name" 2>/dev/null || true)"
+  if [[ -n "$value" ]]; then
+    printf '%s' "$value"
+  else
+    printf '%s' "$default"
+  fi
+}
+
+delay="${TMUX_FOCUS_FLASH_DELAY:-0.16}"
+
+normal_pane_format="$(option_or_default @focus_flash_pane_format_normal '#{?pane_active,#[fg=black#{,}bg=white#{,}bold] [●] #{pane_index} #[default],#[fg=colour244#{,}bg=default] [○] #{pane_index} #[default]}')"
+flash_pane_format="$(option_or_default @focus_flash_pane_format_flash '#{?pane_active,#[fg=colour244#{,}bg=default] [●] #{pane_index} #[default],#[fg=colour244#{,}bg=default] [○] #{pane_index} #[default]}')"
+normal_active_border_style="$(option_or_default @focus_flash_pane_active_border_style_normal 'fg=white,bg=default,bold')"
+flash_active_border_style="$(option_or_default @focus_flash_pane_active_border_style_flash 'fg=colour238,bg=default')"
 
 set_flash() {
-  local value="$1"
-  local current
+  local state="$1"
+  local pane_format
+  local active_border_style
 
-  current="$("${tmux_cmd[@]}" show-option -gqv @focus_flash_token 2>/dev/null || true)"
-  [[ "$current" == "$token" ]] || exit 0
+  if [[ "$state" == "on" ]]; then
+    pane_format="$flash_pane_format"
+    active_border_style="$flash_active_border_style"
+  else
+    pane_format="$normal_pane_format"
+    active_border_style="$normal_active_border_style"
+  fi
 
-  "${tmux_cmd[@]}" set-option -gq @focus_flash_on "$value" || exit 0
+  "${tmux_cmd[@]}" set-option -gq pane-border-format "$pane_format" || true
+  "${tmux_cmd[@]}" set-option -gq pane-active-border-style "$active_border_style" || true
   "${tmux_cmd[@]}" refresh-client 2>/dev/null || true
 }
 
-set_flash 1
+trap 'set_flash off' EXIT
+
+set_flash on
 sleep "$delay"
-set_flash 0
+set_flash off
 sleep "$delay"
-set_flash 1
+set_flash on
 sleep "$delay"
-set_flash 0
+set_flash off
